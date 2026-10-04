@@ -1,0 +1,128 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="grid g2">
+  <div class="card">
+    <h2>证据包（可迁移归档） <a class="btn" href="/evidence/export" style="float:right">＋ 导出新包</a></h2>
+    <p class="small">一个包 = 同一数据库快照切点上，一次发布依赖的<b>模板内容、评估证据、
+      审批、线上调用快照、放量事件、止损事件</b>的完整闭包，含清单、内容寻址对象与
+      逐项摘要。导出期间即使继续写入，本包也只包含切点前的完整关联数据。</p>
+    <table>
+      <thead><tr><th>包标识 / 范围</th><th>来源</th><th>切点</th><th>校验</th><th>对象/分片</th><th></th></tr></thead>
+      <tbody>
+      {% for p in packs %}
+        <tr>
+          <td><a href="/evidence/packs/{{ p.pack_id }}"><b>{{ p.pack_id }}</b></a>
+            {% if p.status == 'imported' %}<span class="badge b-approved">导入（只读）</span>
+            {% else %}<span class="badge b-active">本实例导出</span>{% endif %}
+            <div class="small">{{ p.scope_label }}</div>
+            <div class="small mono">manifest {{ p.short_manifest }}</div></td>
+          <td class="small mono">{{ p.source_instance_id }}<div class="small">{{ p.exported_at }}</div></td>
+          <td class="small">{% if p.status == 'imported' %}导入于 {{ p.imported_at }}
+            {% else %}—{% endif %}</td>
+          <td><span class="chip ok">内容寻址 · 可复核</span></td>
+          <td class="small">{{ p.object_count }} / {{ p.shard_count }}</td>
+          <td><a class="btn ghost" href="/evidence/packs/{{ p.pack_id }}/download">下载 .pgpack</a></td>
+        </tr>
+      {% endfor %}
+      {% if not packs %}<tr><td colspan="6" class="mut small">尚无证据包，点右上角导出。</td></tr>{% endif %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>导入证据包（独立验证，分片续传，原子提交）</h2>
+    <p class="small">选择导出的 <span class="mono">.pgpack</span> 文件：浏览器按信封声明的
+      边界分片上传，支持<b>断点续传</b>；服务端在<b>落库前</b>校验任意对象被改、对象缺失、
+      摘要与清单不符等问题；提交为单事务原子切换，同摘要再导入返回原结果，
+      同标识异内容拒绝且不留半数据。</p>
+    <div class="row">
+      <input type="file" id="pgfile" accept=".pgpack" style="width:60%">
+      <button onclick="pgUpload()">开始上传 / 继续上传</button>
+      <span id="pgstatus" class="small"></span>
+    </div>
+    <pre id="pglog" style="max-height:160px"></pre>
+    <div id="pgcommit" class="row" style="display:none">
+      <form method="post" id="pgcommitform"><button>校验并提交（原子切换）</button></form>
+      <span class="small ok" id="pgcommitinfo"></span>
+    </div>
+
+    <h3>导入会话（进程中断后可在此继续）</h3>
+    <table>
+      <thead><tr><th>import</th><th>包</th><th>状态</th><th>分片</th><th></th></tr></thead>
+      <tbody>
+      {% for im in imports %}
+        <tr>
+          <td class="small mono">{{ im.import_id }}</td>
+          <td class="small mono">{{ im.pack_id }}</td>
+          <td>{% if im.status == 'staging' %}<span class="warn">{{ im.status }}</span>
+            {% elif im.status == 'committed' %}<span class="ok">{{ im.status }}</span>
+            {% else %}<span class="bad">{{ im.status }}</span>{% endif %}
+            <div class="small mut">{{ im.note }}</div></td>
+          <td class="small">{{ im.received_count }}/{{ im.shard_count }}</td>
+          <td>
+            {% if im.status == 'staging' %}
+            <form method="post" action="/ui/evidence/imports/{{ im.import_id }}/abort"
+                  style="display:inline"><button class="danger" type="submit">放弃</button></form>
+            {% elif im.status == 'committed' %}
+            <a class="btn ghost" href="/evidence/packs/{{ im.result_pack_id }}">打开包</a>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      {% if not imports %}<tr><td colspan="5" class="mut small">暂无导入会话。</td></tr>{% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+async function pgUpload(){
+  const f = document.getElementById('pgfile').files[0];
+  const log = document.getElementById('pglog');
+  const statusEl = document.getElementById('pgstatus');
+  if(!f){ statusEl.textContent = '请先选择 .pgpack 文件'; return; }
+  const buf = new Uint8Array(await f.arrayBuffer());
+  // 找第一行（信封）
+  let nl = 0; while(nl < buf.length && buf[nl] !== 10) nl++;
+  const envLine = new TextDecoder().decode(buf.subarray(0, nl + 1));
+  let env;
+  try { env = JSON.parse(envLine); }
+  catch(e){ statusEl.textContent = '不是合法的 .pgpack（首行不是信封）'; return; }
+  const envelope = JSON.parse(new TextDecoder().decode(
+    Uint8Array.from(atob(env.data), ch => ch.charCodeAt(0))));
+  statusEl.textContent = '包 ' + envelope.pack_id + '，' + envelope.shards.length + ' 个分片';
+  // 1) 初始化导入会话（幂等：已提交则直接跳转）
+  let sess;
+  const initResp = await fetch('/api/evidence/imports', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({envelope_line: envLine, actor:'web'})});
+  sess = await initResp.json();
+  if(!initResp.ok){ log.textContent = '初始化失败 ' + initResp.status + ': ' + JSON.stringify(sess); return; }
+  if(sess.already === 'committed'){
+    log.textContent = '该包已按相同摘要导入：' + sess.pack_id + '（返回原结果）';
+    location.href = '/evidence/packs/' + sess.pack_id; return;
+  }
+  const iid = sess.import_id;
+  document.getElementById('pgcommitform').action = '/ui/evidence/imports/' + iid + '/commit';
+  const enc = new TextEncoder();
+  // 2) 逐分片上传（信封声明的字节边界）；已存在的分片服务端幂等跳过
+  for(const d of envelope.shards){
+    const start = 1 + d.start; // 文件偏移：跳过信封行（含\n）
+    const chunk = buf.subarray(start, start + d.length);
+    const sha = await crypto.subtle.digest('SHA-256', chunk);
+    const shaHex = [...new Uint8Array(sha)].map(b=>b.toString(16).padStart(2,'0')).join('');
+    const r = await fetch(`/api/evidence/imports/${iid}/shards/${d.index}`,
+      {method:'PUT', headers:{'X-SHA256':shaHex,'Content-Type':'application/octet-stream'}, body: chunk});
+    if(!r.ok){ const e = await r.json().catch(()=>({message:r.status}));
+      log.textContent = `分片 ${d.index} 被拒绝：` + e.message;
+      document.getElementById('pgcommit').style.display='flex';
+      document.getElementById('pgcommitinfo').textContent =
+        '上传中断 — 重新选择同一文件后点“继续上传”即可续传，会话 ' + iid;
+      return; }
+    log.textContent = `分片 ${d.index}/${envelope.shards.length} 已上传`;
+  }
+  document.getElementById('pgcommit').style.display='flex';
+  document.getElementById('pgcommitinfo').textContent = '全部分片就位，可提交（或中断后随时回来续传）';
+  log.textContent = '全部分片就位：' + iid;
+}
+</script>

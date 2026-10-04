@@ -1,0 +1,132 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/evidence">← 证据包列表</a> ·
+  包 <b class="mono">{{ pid }}</b>
+  {% if meta.status == 'imported' %}<span class="badge b-approved">外部导入 · 只读证据</span>
+  {% else %}<span class="badge b-active">本实例导出</span>{% endif %}
+  · 范围 <b>{{ scope_label }}</b> · 导出切点 <b>{{ meta.exported_at }}</b>
+  （audit id ≤ {{ meta.cutpoint.audit_max_id }}）<br>
+  来源实例 <span class="mono small">{{ meta.source_instance_id }}</span> ·
+  清单哈希 <span class="mono small">{{ short_manifest }}</span> ·
+  信封哈希 <span class="mono small">{{ short_outer }}</span> ·
+  载荷哈希 <span class="mono small">{{ short_archive }}</span>
+</div>
+
+<div class="grid g2">
+  <div class="card">
+    <h2>依赖与校验状态</h2>
+    <div class="kv">
+      <div>清单对象数</div><div>{{ meta.object_count }}（内容寻址，sha256）</div>
+      <div>分片数</div><div>{{ meta.shard_count }}</div>
+      <div>载荷字节</div><div>{{ meta.byte_count }}</div>
+      <div>校验</div><div><span class="ok">●</span> 打开时已按清单复算全部对象哈希、
+        引用闭包与语义不变量</div>
+      <div>导入审计</div>
+      <div>{% for a in meta.audit %}
+        <div class="small">{{ a.created_at }} <b>{{ a.action }}</b>
+          <span class="mut">{{ a.actor }} {{ a.detail }}</span></div>
+        {% endfor %}</div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <a class="btn" href="/evidence/packs/{{ pid }}/download">下载 .pgpack（逐字节归档）</a>
+    </div>
+    <h3>各表计数（清单摘要）</h3>
+    <table>
+      <tbody>
+      {% for cr in count_rows %}
+        <tr><td class="mono small">{{ cr.table }}</td><td class="small">{{ cr.n }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>模板版本与评估 / 审批</h2>
+    <table>
+      <thead><tr><th>版本</th><th>状态</th><th>模型/哈希</th><th>评估</th><th></th></tr></thead>
+      <tbody>
+      {% for v in versions %}
+        <tr><td><b>v{{ v.semver }}</b>
+            {% if v.is_active %}<span class="badge b-active">切点线上</span>{% endif %}
+            <div class="small mono">{{ v.version_id }}</div></td>
+          <td><span class="badge b-{{ v.status }}">{{ v.status }}</span>
+            <div class="small">{{ v.contract_change }}{% if v.permission_expanded %} ·
+              <span class="warn">权限扩大</span>{% endif %}</div></td>
+          <td class="small mono">{{ v.model_id }}<div>{{ v.short_hash }}</div></td>
+          <td class="small">{{ v.n_eval }} 次评估</td>
+          <td><a href="/evidence/packs/{{ pid }}/versions/{{ v.version_id }}/eval">证据/审批</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="grid g2" style="margin-top:16px">
+  <div class="card">
+    <h2>放量事件</h2>
+    <table>
+      <thead><tr><th>批次</th><th>候选→基线</th><th>权重/状态</th><th>止损历史</th></tr></thead>
+      <tbody>
+      {% for r in rollouts %}
+        <tr><td class="small mono">{{ r.rollout_id }}</td>
+          <td class="small">v{{ r.candidate_semver }} → v{{ r.base_semver }}</td>
+          <td class="small">{{ r.weight }}% ·
+            <span class="badge b-{{ r.status }}">{{ r.status }}</span> gen {{ r.generation }}
+            {% if r.is_tripped %}<span class="bad">已止损</span>{% endif %}</td>
+          <td><a href="/evidence/packs/{{ pid }}/rollouts/{{ r.rollout_id }}/stoploss">打开</a></td>
+        </tr>
+      {% endfor %}
+      {% if not rollouts %}<tr><td colspan="4" class="small mut">无放量批次。</td></tr>{% endif %}
+      </tbody>
+    </table>
+    <h3>止损触发快照</h3>
+    <table>
+      <tbody>
+      {% for t in triggers %}
+        <tr><td class="small mono">{{ t.trigger_id }}</td>
+          <td class="small">{{ t.created_at }} v{{ t.candidate_semver }}</td>
+          <td class="small bad">{{ t.fail_count }}/{{ t.total_sample }}</td>
+          <td><a href="/evidence/packs/{{ pid }}/rollouts/{{ t.rollout_id }}/stoploss">查看</a></td>
+        </tr>
+      {% endfor %}
+      {% if not triggers %}<tr><td colspan="4" class="small mut">未触发过止损。</td></tr>{% endif %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>线上调用快照（可复查）</h2>
+    <table>
+      <thead><tr><th>request</th><th>版本/模型</th><th>批次</th><th>时间</th><th></th></tr></thead>
+      <tbody>
+      {% for r in requests %}
+        <tr><td class="small mono">{{ r.request_id }}</td>
+          <td class="small">v{{ r.semver }}<div class="mono">{{ r.model_id }}</div></td>
+          <td class="small">{{ r.rollout_id }}</td>
+          <td class="small">{{ r.created_at }}</td>
+          <td><a href="/evidence/packs/{{ pid }}/requests/{{ r.request_id }}/replay">复查</a></td>
+        </tr>
+      {% endfor %}
+      {% if not requests %}<tr><td colspan="5" class="small mut">无调用记录。</td></tr>{% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>清单逐项摘要（manifest items）</h2>
+  {% for g in groups %}
+  <h3>{{ g.table }} · {{ g.count }}</h3>
+  <table>
+    <thead><tr><th>主键</th><th>摘要</th><th>对象 sha256</th><th>字节</th></tr></thead>
+    <tbody>
+    {% for it in g.items %}
+      <tr><td class="small mono">{{ it.id }}</td><td class="small">{{ it.summary }}</td>
+        <td class="small mono">{{ it.object }}</td><td class="small">{{ it.size }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endfor %}
+</div>

@@ -1,0 +1,180 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/families/{{ family.family_id }}/rollout">← 返回 {{ family.name }} · 放量批次</a> ·
+  业务方为本次试投设置<b>滚动观察窗口</b>、<b>最小样本量</b>与<b>失败占比上限</b>，
+  随后用 <span class="mono">request_id + feedback_id</span> 报告成功/失败。
+  只有<b>真实由该试投产生、命中候选构件、且属于当前代次</b>、在窗口内的回执才入账；
+  重复回执、旧代次、基线/无关请求、迟到回执<b>只留审计记录，不触发状态变化</b>。
+  窗口内样本达门槛且失败占比<b>严格越过</b>上限时，单事务冻结批次、新流量回落基线并保存快照；
+  人工恢复开启新代次并重置窗口，旧窗口与历史请求仍可复核。
+</div>
+
+<div class="card">
+  <h2>批次现场
+    {% if ro.is_tripped %}<span class="badge b-failed_eval">⛔ frozen · 自动止损已触发</span>
+    {% elif ro.is_ramping %}<span class="badge b-evaluating">ramping 放量中</span>
+    {% else %}<span class="badge b-{{ ro.status }}">{{ ro.status }}</span>{% endif %}
+  </h2>
+  <div class="kv">
+    <div>rollout_id</div><div class="mono">{{ ro.rollout_id }}</div>
+    <div>候选 → 基线</div><div><b>v{{ ro.candidate_semver }}</b>
+      <span class="mono small">{{ ro.candidate_version_id }}</span> →
+      <b>v{{ ro.base_semver }}</b>
+      <span class="mono small">{{ ro.base_version_id }}</span></div>
+    <div>权重 / 代次</div><div>{{ ro.weight }}% · gen <b>{{ ro.generation }}</b></div>
+  </div>
+</div>
+
+<div class="grid g2" style="margin-top:16px">
+  <div class="card">
+    <h2>止损配置</h2>
+    {% if ro.is_tripped %}
+    <div class="flash" style="background:rgba(239,91,91,.12)">批次已被止损冻结。
+      人工恢复会按下方配置开启新窗口；恢复前可调整配置。</div>
+    {% endif %}
+    <form method="post" action="/ui/rollouts/{{ ro.rollout_id }}/stoploss/config">
+      <label>滚动观察窗口（秒，按请求产生时间计）</label>
+      <input name="window_seconds" type="number" min="1" value="{{ cfg.window_seconds }}"
+             placeholder="例如 3600" required>
+      <label>最小样本量（窗口内入账回执数达到才评估）</label>
+      <input name="min_sample" type="number" min="1" value="{{ cfg.min_sample }}"
+             placeholder="例如 20" required>
+      <label>失败占比上限（0~1，严格越过才止损；如 0.2 = 20%）</label>
+      <input name="fail_ratio_limit" type="number" step="0.01" min="0.01" max="1"
+             value="{{ cfg.fail_ratio_limit }}" placeholder="例如 0.2" required>
+      <div class="row" style="margin-top:10px"><button>保存配置</button></div>
+    </form>
+    {% if active_has_receipts %}
+    <p class="small warn" style="margin-top:8px">当前窗口已有入账回执，门槛已冻结：
+      需先人工恢复（开窗）后才能改配，避免窗口中途移动门槛。</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>当前统计窗口（实时滚动）</h2>
+    {% if active %}
+    <div class="kv">
+      <div>window_id</div><div class="mono small">{{ active.window_id }}</div>
+      <div>窗口序号</div><div>#{{ active.seq }}（active）</div>
+      <div>开窗时刻</div><div>{{ active.started_at }}</div>
+      <div>窗口参数</div><div>{{ active.window_seconds }}s · 最小样本 {{ active.min_sample }}
+        · 失败上限 {{ active.fail_pct }}</div>
+      <div>窗口内累计</div><div>样本 <b>{{ active.total }}</b> / 失败 <b class="bad">{{ active.fails }}</b>
+        · 失败占比 <b>{{ active.fail_pct }}</b></div>
+    </div>
+    <p class="small" style="margin-top:8px">
+      {% if active.at_or_over_sample %}样本已达门槛；失败占比
+        {% if active.over_limit %}<span class="bad">越界</span>
+        {% else %}<span class="ok">未越界</span>{% endif %}。
+      {% else %}样本未达最小门槛（{{ active.total }}/{{ active.min_sample }}），不触发。{% endif %}
+    </p>
+    {% else %}
+    <p class="mut">暂无 active 窗口（批次未开始收回执，或窗口已触发/关闭）。首条有效回执会自动开窗。</p>
+    {% endif %}
+
+    {% if ro.is_tripped %}
+    <h3>人工恢复</h3>
+    <form method="post" action="/ui/rollouts/{{ ro.rollout_id }}/stoploss/recover">
+      <input type="hidden" name="expected_generation" value="{{ ro.generation }}">
+      <p class="small">以 <span class="mono">expected_generation={{ ro.generation }}</span> 做 CAS：
+        开启新代次（gen +1）、统计窗口重置（新窗口 seq+1、计数清零），权重保持 {{ ro.weight }}%；
+        旧窗口、触发快照与历史请求全部保留可复核。</p>
+      <button>人工恢复（新代次 + 重置窗口）</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>触发快照（自动止损历史）</h2>
+  {% if triggers %}
+  <table>
+    <thead><tr><th>trigger_id</th><th>时间</th><th>窗口</th><th>代次</th><th>候选→基线</th>
+      <th>权重</th><th>样本/失败</th><th>失败占比</th><th>触发回执</th></tr></thead>
+    <tbody>
+    {% for t in triggers %}
+      <tr>
+        <td class="small mono"><a href="/api/stoploss/triggers/{{ t.trigger_id }}">{{ t.trigger_id }}</a></td>
+        <td class="small">{{ t.created_at }}</td>
+        <td class="small mono">{{ t.window_id }}</td>
+        <td class="small mono">gen {{ t.rollout_generation }}</td>
+        <td class="small">v{{ t.candidate_semver }} → v{{ t.base_semver }}</td>
+        <td class="small">{{ t.weight }}%</td>
+        <td class="small">{{ t.total_sample }} / <b class="bad">{{ t.fail_count }}</b></td>
+        <td class="small"><b class="bad">{{ t.fail_pct }}</b></td>
+        <td class="small mono">{{ t.trigger_feedback_id }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="mut">尚无触发记录。</p>{% endif %}
+</div>
+
+<div class="grid g2" style="margin-top:16px">
+  <div class="card">
+    <h2>统计窗口历史（旧窗口保留复核）</h2>
+    <table>
+      <thead><tr><th>#</th><th>状态</th><th>窗口参数</th><th>样本/失败</th><th>占比</th><th>开窗</th></tr></thead>
+      <tbody>
+      {% for w in windows %}
+        <tr>
+          <td class="mono">#{{ w.seq }}</td>
+          <td>{% if w.status == 'tripped' %}<span class="badge b-failed_eval">{{ w.status }}</span>
+            {% elif w.status == 'active' %}<span class="badge b-ramping">{{ w.status }}</span>
+            {% else %}<span class="badge b-cancelled">{{ w.status }}</span>{% endif %}</td>
+          <td class="small">{{ w.window_seconds }}s / n≥{{ w.min_sample }} / {{ w.limit_pct }}</td>
+          <td class="small">{{ w.total }} / {{ w.fails }}</td>
+          <td class="small">{{ w.fail_pct }}</td>
+          <td class="small">{{ w.started_at }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>被拒回执（仅审计，无状态变化）</h2>
+    <table>
+      <thead><tr><th>时间</th><th>feedback_id</th><th>类型</th><th>详情</th></tr></thead>
+      <tbody>
+      {% for r in rejected %}
+        <tr>
+          <td class="small">{{ r.created_at }}</td>
+          <td class="small mono">{{ r.entity_id }}</td>
+          <td class="small">{% if r.action == 'feedback.duplicate' %}
+            <span class="badge b-failed_eval">重复回执</span>
+            {% else %}<span class="chip">拒绝入账</span>{% endif %}</td>
+          <td class="small mut">{{ r.detail }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% if rejected %}{% else %}<p class="mut">暂无被拒/重复回执。</p>{% endif %}
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>入账回执明细（feedback_id 唯一 · request_id 唯一）</h2>
+  <table>
+    <thead><tr><th>feedback_id</th><th>结果</th><th>request_id</th><th>窗口</th>
+      <th>命中构件</th><th>routing_key</th><th>命中代次</th><th>请求产生时间</th><th></th></tr></thead>
+    <tbody>
+    {% for r in receipts %}
+      <tr>
+        <td class="small mono">{{ r.feedback_id }}</td>
+        <td>{% if r.outcome == 'failure' %}<span class="badge b-failed_eval">failure</span>
+          {% else %}<span class="badge b-active">success</span>{% endif %}</td>
+        <td class="small mono">{{ r.request_id }}</td>
+        <td class="small">#{{ r.window_seq }}</td>
+        <td class="small mono">v{{ r.hit_semver }}</td>
+        <td class="small mono">{{ r.routing_key }}</td>
+        <td class="small mono">gen {{ r.hit_generation }}</td>
+        <td class="small">{{ r.request_created_at }}</td>
+        <td><a href="/requests/{{ r.request_id }}/replay">调用详情</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% if receipts %}{% else %}<p class="mut">尚无入账回执。</p>{% endif %}
+</div>

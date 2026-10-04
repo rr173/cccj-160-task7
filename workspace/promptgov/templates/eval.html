@@ -1,0 +1,151 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/families/{{ family.family_id }}">← 返回 {{ family.name }}</a> ·
+  版本 <b>v{{ v.semver }}</b> <span class="mono small">({{ v.version_id }})</span> ·
+  状态 <span class="badge b-{{ v.status }}">{{ v.status }}</span> ·
+  内容哈希 <span class="mono small">{{ v.short_hash }}</span> ·
+  绑定模型 <span class="mono small">{{ v.model_id }}</span><br>
+  契约：{% if v.contract_change == 'compatible' %}兼容升级{% elif v.contract_change == 'breaking' %}
+  <span class="bad">破坏性变更</span>{% else %}无变化{% endif %} ·
+  工具权限扩大：{% if v.permission_expanded %}<span class="warn">是（发布前必须重新走 tool_expansion 审批）</span>
+  {% else %}否{% endif %} · 发布门槛通过率 = {{ threshold }}
+</div>
+
+<div class="grid g2">
+  <div class="card">
+    <h2>评估证据（固定测试集，证据不可变）</h2>
+    <p class="small">证据绑定<b>版本内容哈希 + 模型标识</b>；模板或模型变化后旧证据不再支撑发布。
+      “迟到”标记表示证据返回时该版本已离开候选态，但证据仍保留可复核。</p>
+    <table>
+      <thead><tr><th>run</th><th>状态</th><th>模型</th><th>通过</th><th>迟到</th><th>时间</th><th></th></tr></thead>
+      <tbody>
+      {% for r in runs %}
+        <tr {% if r.selected %}style="background:#1b2438"{% endif %}>
+          <td class="small mono">{{ r.run_id }}</td>
+          <td>{% if r.status == 'passed' %}<span class="ok">●</span>{% else %}<span class="bad">●</span>{% endif %}
+            {{ r.status }}<div class="small">rate {{ r.pass_rate }}</div></td>
+          <td class="small mono">{{ r.model_id }}</td>
+          <td class="small">{{ r.passed }}/{{ r.total }}</td>
+          <td>{% if r.late %}<span class="warn">迟到</span>{% else %}<span class="mut">—</span>{% endif %}</td>
+          <td class="small">{{ r.created_at }}</td>
+          <td><a href="/versions/{{ v.version_id }}/eval?run={{ r.run_id }}">查看证据</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class="row" style="margin-top:12px">
+      <form method="post" action="/ui/versions/{{ v.version_id }}/eval-start">
+        <button>新建评估运行</button>
+      </form>
+      {% for r in runs %}
+        {% if r.status == 'running' %}
+        <form method="post" action="/ui/eval-runs/{{ r.run_id }}/run">
+          <button class="ghost">完成迟到/在途评估 {{ r.run_id }}</button>
+        </form>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>发布门禁与审批</h2>
+    <ul class="small">
+      <li>① 固定测试集存在<b>通过</b>证据，且证据模型 = 版本绑定模型</li>
+      <li>② 存在通过的 <b>release</b> 发布审批</li>
+      <li>③ 工具权限若相对线上扩大，必须有 <b>tool_expansion</b> 专项审批</li>
+      <li>④ 发布/回滚为单事务 + CAS，并发只会有一个成功</li>
+    </ul>
+    <h3>新增审批</h3>
+    <form method="post" action="/ui/versions/{{ v.version_id }}/approve">
+      <label>审批类型</label>
+      <select name="kind">
+        <option value="release">release（发布审批）</option>
+        <option value="tool_expansion">tool_expansion（工具权限扩大专项）</option>
+      </select>
+      <label>结论</label>
+      <select name="decision"><option value="approved">approved</option>
+        <option value="rejected">rejected</option></select>
+      <label>审批人</label><input name="approver" placeholder="security / ops-lead">
+      <label>理由</label><input name="reason" placeholder="例如：新增 refund.execute 已复核风险">
+      <div class="note" style="margin:10px 0">
+        <b>有效期（仅 tool_expansion 生效）</b>：留空 = 永久授权（兼容旧审批）；
+        半开区间 [生效, 失效)，失效时刻一到立即失去门禁资格。时间格式
+        <span class="mono">YYYY-MM-DD HH:MM:SS</span>（可只填到分钟）。
+      </div>
+      <div class="grid g2">
+        <div><label>生效时刻（空=即刻）</label>
+          <input name="valid_from" placeholder="2026-10-04 09:00:00"></div>
+        <div><label>失效时刻（空=永久）</label>
+          <input name="valid_until" placeholder="2026-10-11 18:00:00"></div>
+      </div>
+      <label>授权覆盖工具（空=候选全部工具；逗号分隔，只覆盖部分工具过不了门禁）</label>
+      <input name="granted_tools" placeholder="ticket.read, kb.search, refund.execute">
+      <div class="row" style="margin-top:10px"><button>提交审批</button>
+        <a class="btn ghost" href="/approvals?version={{ v.version_id }}">打开审批操作页 →</a>
+      </div>
+    </form>
+    <h3>审批记录（有效状态 / 剩余时间 / 撤销）</h3>
+    <table>
+      <thead><tr><th>类型</th><th>结论/状态</th><th>覆盖工具</th><th>有效期</th><th>剩余</th>
+      <th>审批人</th><th>操作</th></tr></thead>
+      <tbody>
+      {% for a in approvals %}
+        <tr><td><span class="chip">{{ a.kind }}</span></td>
+          <td>{% if a.decision == 'approved' %}<span class="ok">{{ a.decision }}</span>
+            {% else %}<span class="bad">{{ a.decision }}</span>{% endif %}
+            {% if a.decision == 'approved' %}<br><span class="badge b-{{ a.state }}">{{ a.state }}</span>{% endif %}
+            <div class="small">{{ a.created_at }}</div></td>
+          <td class="small mono">{{ a.granted_tools }}</td>
+          <td class="small">{% if a.is_permanent %}永久
+            {% else %}{{ a.valid_from or '即刻' }}<br>~ {{ a.valid_until or '永久' }}{% endif %}
+            {% if a.revoked_at %}<br><span class="bad">已撤销 @ {{ a.revoked_at }}
+              by {{ a.revoked_by }}</span>{% endif %}</td>
+          <td class="small">{% if a.remaining_human %}{{ a.remaining_human }}
+            {% elif a.wait_human %}<span class="warn">{{ a.wait_human }} 后生效</span>
+            {% else %}—{% endif %}</td>
+          <td class="small">{{ a.approver }}<div class="small mut">{{ a.reason }}</div></td>
+          <td>{% if a.can_revoke %}
+            <form method="post" action="/ui/approvals/{{ a.approval_id }}/revoke"
+                  onsubmit="return confirm('确认提前撤销该授权？撤销后建批/命中/转正立即失效，历史调用不受影响。')">
+              <input type="hidden" name="expected_version" value="{{ a.revoke_version }}">
+              <input type="hidden" name="back" value="/versions/{{ v.version_id }}/eval">
+              <input name="reason" placeholder="撤销理由（可选）">
+              <button class="danger" style="margin-top:6px">提前撤销</button>
+            </form>
+            {% else %}<span class="mut">—</span>{% endif %}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% if cases %}
+<div class="card" style="margin-top:16px">
+  <h2>逐用例证据明细 {% if cur_run %}<span class="small mono">（{{ cur_run.run_id }}，模型 {{ cur_run.model_id }}）</span>{% endif %}</h2>
+  <table>
+    <thead><tr><th>#</th><th>用例</th><th>结果</th><th>判定说明</th><th>输入摘要</th><th>输出摘要</th></tr></thead>
+    <tbody>
+    {% for c in cases %}
+      <tr>
+        <td>{{ c.seq }}</td><td>{{ c.name }}</td>
+        <td>{% if c.ok %}<span class="ok">PASS</span>{% else %}<span class="bad">FAIL</span>{% endif %}</td>
+        <td class="small">{{ c.detail }}</td>
+        <td class="small mono">{{ c.input_digest }}</td>
+        <td class="small mono">{{ c.output_digest }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <div class="grid g2" style="margin-top:14px">
+    {% for c in cases %}
+      <div>
+        <h3>用例 {{ c.seq }} · {{ c.name }} 渲染后提示</h3>
+        <pre>{{ c.rendered_prompt | e }}</pre>
+        <h3>模型输出</h3>
+        <pre>{{ c.output | e }}</pre>
+      </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}

@@ -1,0 +1,88 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/evidence/packs/{{ pid }}">← 返回证据包</a> ·
+  <span class="chip">只读归档证据（不可再发起评估/审批）</span><br>
+  模板族 <b>{{ family.name }}</b> · 版本 <b>v{{ v.semver }}</b>
+  <span class="mono small">({{ v.version_id }})</span> ·
+  <span class="badge b-{{ v.status }}">{{ v.status }}</span> ·
+  内容哈希 <span class="mono small">{{ v.short_hash }}</span> ·
+  绑定模型 <span class="mono small">{{ v.model_id }}</span> ·
+  发布门槛通过率 = {{ threshold }}
+</div>
+
+<div class="grid g2">
+  <div class="card">
+    <h2>评估证据（切点固化，不可变）</h2>
+    <table>
+      <thead><tr><th>run</th><th>状态</th><th>模型</th><th>通过</th><th>迟到</th><th>时间</th><th></th></tr></thead>
+      <tbody>
+      {% for r in runs %}
+        <tr {% if r.selected %}style="background:#1b2438"{% endif %}>
+          <td class="small mono">{{ r.run_id }}</td>
+          <td>{% if r.status == 'passed' %}<span class="ok">●</span>{% else %}<span class="bad">●</span>{% endif %}
+            {{ r.status }}<div class="small">rate {{ r.pass_rate }}</div></td>
+          <td class="small mono">{{ r.model_id }}</td>
+          <td class="small">{{ r.passed }}/{{ r.total }}</td>
+          <td>{% if r.late %}<span class="warn">迟到</span>{% else %}<span class="mut">—</span>{% endif %}</td>
+          <td class="small">{{ r.created_at }}</td>
+          <td><a href="/evidence/packs/{{ pid }}/versions/{{ v.version_id }}/eval?run={{ r.run_id }}">查看</a></td>
+        </tr>
+      {% endfor %}
+      {% if not runs %}<tr><td colspan="7" class="small mut">该版本在切点无评估证据。</td></tr>{% endif %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>审批记录（归档快照）</h2>
+    <table>
+      <thead><tr><th>类型</th><th>结论/状态</th><th>覆盖工具</th><th>有效期</th>
+      <th>审批人</th><th>时间</th></tr></thead>
+      <tbody>
+      {% for a in approvals %}
+        <tr><td><span class="chip">{{ a.kind }}</span></td>
+          <td>{% if a.decision == 'approved' %}<span class="ok">{{ a.decision }}</span>
+            {% else %}<span class="bad">{{ a.decision }}</span>{% endif %}
+            {% if a.decision == 'approved' %}
+            <br><span class="badge b-{{ a.state }}">{{ a.state }}</span>{% endif %}</td>
+          <td class="small mono">{{ a.granted_tools }}</td>
+          <td class="small">{% if a.is_permanent %}永久
+            {% else %}{{ a.valid_from or '即刻' }} ~ {{ a.valid_until or '永久' }}{% endif %}
+            {% if a.revoked_at %}<br><span class="bad">已撤销 {{ a.revoked_at }}</span>{% endif %}</td>
+          <td class="small">{{ a.approver }}</td>
+          <td class="small">{{ a.created_at }}</td></tr>
+      {% endfor %}
+      {% if not approvals %}<tr><td colspan="6" class="small mut">无审批记录。</td></tr>{% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% if cases %}
+<div class="card" style="margin-top:16px">
+  <h2>逐用例证据明细 {% if cur_run %}<span class="small mono">（{{ cur_run.run_id }}，模型 {{ cur_run.model_id }}）</span>{% endif %}</h2>
+  <table>
+    <thead><tr><th>#</th><th>用例</th><th>结果</th><th>判定说明</th><th>输入摘要</th><th>输出摘要</th></tr></thead>
+    <tbody>
+    {% for c in cases %}
+      <tr><td>{{ c.seq }}</td><td>{{ c.name }}</td>
+        <td>{% if c.ok %}<span class="ok">PASS</span>{% else %}<span class="bad">FAIL</span>{% endif %}</td>
+        <td class="small">{{ c.detail }}</td>
+        <td class="small mono">{{ c.input_digest }}</td>
+        <td class="small mono">{{ c.output_digest }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <div class="grid g2" style="margin-top:14px">
+    {% for c in cases %}
+      <div>
+        <h3>用例 {{ c.seq }} · {{ c.name }} 渲染后提示</h3>
+        <pre>{{ c.rendered_prompt | e }}</pre>
+        <h3>模型输出</h3>
+        <pre>{{ c.output | e }}</pre>
+      </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}

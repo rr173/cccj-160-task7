@@ -1,0 +1,121 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/evidence/packs/{{ pid }}">← 返回证据包</a> ·
+  <span class="chip">只读调用快照复查（归档内复核，不重新推理）</span><br>
+  原请求固化三元组：版本 <span class="mono small">{{ req.version_id }} (v{{ req.semver }})</span> ·
+  模型 <span class="mono small">{{ req.model_id }}</span> ·
+  输入摘要 <span class="mono small">{{ req.input_digest }}</span>；
+  模板哈希 <span class="mono small">{{ req.short_template_hash }}</span>。
+  {% if req.rollout_id %}命中放量批次 <span class="mono small">{{ req.rollout_id }}</span>
+  · 代次 <span class="mono small">{{ req.rollout_generation }}</span>。{% endif %}
+  产生时间 {{ req.created_at }}。
+</div>
+
+{% if authz %}
+<div class="card">
+  <h2>工具扩权授权快照（命中时固化，归档内复核）</h2>
+  {% if authz.required %}
+  <div class="kv">
+    <div>命中时状态</div><div><span class="badge b-{{ authz.state_at_check }}">
+      {{ authz.state_at_check }}</span> · 复核时刻
+      <span class="mono small">{{ authz.checked_at }}</span></div>
+    <div>授权记录</div><div class="mono small">{{ authz.approval_id }}
+      （{{ authz.approver }}，版本 v{{ authz.revoke_version }}）</div>
+    <div>有效期</div><div>{{ authz.window_text }}</div>
+    <div>新增工具</div><div>{% for t in authz.added_tools %}<span class="chip">{{ t }}</span>{% endfor %}</div>
+    <div>覆盖工具</div><div>{% for t in authz.granted_tools %}<span class="chip">{{ t }}</span>{% endfor %}</div>
+    <div>切点状态对照</div><div>
+      {% if authz.current_exists %}<span class="badge b-{{ authz.current_state }}">
+        {{ authz.current_state }}</span><span class="small mut">（按导出切点时刻）</span>
+        {% if authz.current_state != authz.state_at_check %}
+        <div class="small warn">切点时授权已变化（{{ authz.state_at_check }} →
+          {{ authz.current_state }}），但历史调用结论按命中时快照复查，不改写。</div>
+        {% endif %}
+      {% else %}<span class="mut">授权记录不在本包范围（边界外部引用）</span>{% endif %}</div>
+  </div>
+  {% else %}
+  <p class="small">该命中未走扩权复核（命中基线或候选未新增工具）。</p>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if req.rollout_id %}
+<div class="card">
+  <h2>生产推理效果回执（归档快照）
+    {% if rollout %}<a class="chip"
+       href="/evidence/packs/{{ pid }}/rollouts/{{ req.rollout_id }}/stoploss">止损历史 →</a>{% endif %}
+  </h2>
+  {% if has_receipt %}
+  <p>本请求已入账回执 <span class="mono">{{ receipt.feedback_id }}</span>：
+    {% if receipt.outcome == 'failure' %}<span class="badge b-failed_eval">failure</span>
+    {% else %}<span class="badge b-active">success</span>{% endif %}
+    · 入账时间 {{ receipt.created_at }} · 窗口 <span class="mono small">{{ receipt.window_id }}</span>
+    · 请求产生时间 {{ receipt.request_created_at }}</p>
+  {% else %}
+  <p class="small mut">该调用在切点没有入账回执（可能命中基线/旧代次/超窗，或切点时尚未回报；
+    被拒尝试见止损历史页的审计流）。</p>
+  {% endif %}
+  {% if rollout %}
+  <div class="kv">
+    <div>批次切点状态</div><div>{{ rollout.status }} gen {{ rollout.generation }}
+      {% if rollout.stoploss_tripped %}<span class="badge b-failed_eval">已自动止损</span>{% endif %}</div>
+    <div>命中批次代次</div><div class="mono">{{ req.rollout_generation }}</div>
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="grid g2">
+  <div class="card">
+    <h2>原请求存档（不可变）</h2>
+    <div class="kv">
+      <div>request_id</div><div class="mono">{{ req.request_id }}</div>
+      <div>时间</div><div>{{ req.created_at }}</div>
+      <div>命中构件</div><div class="mono">{{ req.version_id }} (v{{ req.semver }})</div>
+      <div>模型</div><div class="mono">{{ req.model_id }}</div>
+      <div>模板哈希</div><div class="mono">{{ req.template_hash }}</div>
+      <div>输入摘要</div><div class="mono">{{ req.input_digest }}</div>
+      <div>输出摘要</div><div class="mono">{{ req.output_digest }}</div>
+      {% if req.routing_key %}<div>routing_key</div><div class="mono">{{ req.routing_key }}</div>{% endif %}
+      {% if req.rollout_id %}
+      <div>放量批次</div><div class="mono">{{ req.rollout_id }}</div>
+      <div>命中批次代次</div><div class="mono">{{ req.rollout_generation }}</div>
+      {% endif %}
+      {% if req.params_fingerprint %}<div>参数指纹</div><div class="mono">{{ req.params_fingerprint }}</div>{% endif %}
+    </div>
+    {% if req.params_json %}
+    <h3>调用时推理配置（固化快照）</h3><pre>{{ req.params_json | e }}</pre>
+    {% endif %}
+    <h3>渲染后系统提示</h3><pre>{{ req.rendered_prompt | e }}</pre>
+    <h3>原始输入</h3><pre>{{ req.inputs_json | e }}</pre>
+    <h3>原始输出</h3><pre>{{ req.output | e }}</pre>
+  </div>
+
+  <div class="card">
+    <h2>归档内历史重演记录</h2>
+    <table>
+      <thead><tr><th>模式</th><th>结论</th><th>轴</th><th>时间</th></tr></thead>
+      <tbody>
+      {% for r in replays %}
+        <tr><td class="small">{{ r.mode }}</td>
+          <td class="small"><b>{{ r.verdict }}</b></td>
+          <td class="small">{{ r.changed_axis }}</td>
+          <td class="small">{{ r.created_at }}</td></tr>
+      {% endfor %}
+      {% if not replays %}<tr><td colspan="4" class="small mut">切点时该请求尚无重演记录。</td></tr>{% endif %}
+      </tbody>
+    </table>
+    {% for r in replays %}
+    <div>
+      <h3>{{ r.verdict }}（{{ r.created_at }}）</h3>
+      <div class="axis">
+        <div>模板<br>{% if r.same_template %}<span class="ok">一致</span>{% else %}<span class="bad">不同</span>{% endif %}</div>
+        <div>模型<br>{% if r.same_model %}<span class="ok">一致</span>{% else %}<span class="bad">不同</span>{% endif %}</div>
+        <div>输入<br>{% if r.same_input %}<span class="ok">一致</span>{% else %}<span class="bad">不同</span>{% endif %}</div>
+        <div>输出<br>{% if r.same_output %}<span class="ok">一致</span>{% else %}<span class="bad">不同</span>{% endif %}</div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>

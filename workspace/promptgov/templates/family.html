@@ -1,0 +1,113 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  模板族 <b>{{ family.name }}</b> <span class="mono small">({{ family.family_id }})</span> ·
+  固定测试集：<b>{{ testset_name }}</b>（{{ case_count }} 条，不可变）。
+  线上指针在<b>单事务</b>中翻转，热更新 / 回滚并发时用 CAS 保证流量只看到一个完整版本。
+  <a href="/families/{{ family.family_id }}/rollout"><b>分批放量 →</b></a>
+  {% if rollout %}<span class="chip warn">放量中：{{ rollout.weight }}% → 候选 · 代次 {{ rollout.generation }}</span>{% endif %}
+  <a class="chip" href="/evidence/export?kind=family&family_id={{ family.family_id }}">📦 导出本族证据包 →</a>
+</div>
+
+<div class="grid g2">
+  <div class="card">
+    <h2>版本列表（内容不可变）</h2>
+    <table>
+      <thead><tr><th>版本</th><th>状态</th><th>契约</th><th>工具权限</th><th>证据/模型</th><th>操作</th></tr></thead>
+      <tbody>
+      {% for v in versions %}
+        <tr>
+          <td><b>v{{ v.semver }}</b>
+            <div class="small mono">hash {{ v.short_hash }}</div>
+            {% if v.is_active %}<span class="badge b-active">线上</span>{% endif %}
+          </td>
+          <td><span class="badge b-{{ v.status }}">{{ v.status }}</span>
+            {% if v.pass_rate %}
+              <div class="small">通过率 {{ v.pass_rate }}</div>
+            {% endif %}
+          </td>
+          <td>{% if v.contract_change == 'compatible' %}<span class="chip ok">兼容升级</span>
+            {% elif v.contract_change == 'breaking' %}<span class="chip bad">破坏性</span>
+            {% else %}<span class="small mut">无变化</span>{% endif %}
+            {% if v.permission_expanded %}<div class="chip warn" style="margin-top:4px">权限扩大·需审批</div>{% endif %}
+          </td>
+          <td class="small">{% for t in v.tools %}<span class="chip">{{ t }}</span> {% endfor %}</td>
+          <td class="small mono">{{ v.model_id }}</td>
+          <td class="small">
+            <a href="/versions/{{ v.version_id }}/eval">评估/审批</a>
+            {% if v.can_promote %}
+              <form method="post" action="/ui/families/{{ family.family_id }}/promote" style="margin-top:6px">
+                <input type="hidden" name="version_id" value="{{ v.version_id }}">
+                <input type="hidden" name="expected_active" value="{{ v.active_id_or_empty }}">
+                <button class="ghost" style="padding:4px 10px">热发布</button>
+              </form>
+            {% endif %}
+            {% if v.can_rollback %}
+              <form method="post" action="/ui/families/{{ family.family_id }}/rollback" style="margin-top:6px">
+                <input type="hidden" name="target_version_id" value="{{ v.version_id }}">
+                <input type="hidden" name="expected_active" value="{{ v.active_id_or_empty }}">
+                <button class="danger" style="padding:4px 10px">回滚到此版</button>
+              </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>新版本（系统指令 + 变量契约 + 工具权限 + 模型参数）</h2>
+    <form method="post" action="/ui/families/{{ family.family_id }}/versions">
+      <label>语义版本 semver</label>
+      <input name="semver" value="{{ defaults.semver }}" placeholder="1.2.0" required>
+      <label>绑定模型标识 model_id（进入内容指纹）</label>
+      <select name="model_id">
+        {% for m in models %}<option value="{{ m.model_id }}">{{ m.model_id }} — {{ m.label }}</option>{% endfor %}
+      </select>
+      <label>系统指令 system_instruction（受限模板语法）</label>
+      <textarea name="system_instruction" required>{{ defaults.system_instruction }}</textarea>
+      <label>变量契约 variable_contract（JSON）</label>
+      <textarea name="variable_contract">{{ defaults.contract }}</textarea>
+      <label>工具权限 tool_permissions（逗号分隔；新增工具=权限扩大，须专项审批）</label>
+      <input name="tool_permissions" value="{{ defaults.tools }}">
+      <label>模型参数 model_params（JSON）</label>
+      <textarea name="model_params">{{ defaults.params }}</textarea>
+      <div class="row" style="margin-top:12px"><button>创建草稿并去评估</button></div>
+    </form>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>线上调用（只能消费当前线上完整版本；版本与模型由系统绑定）</h2>
+  <div class="grid g2">
+    <form method="post" action="/ui/families/{{ family.family_id }}/invoke">
+      <label>输入 inputs（按命中版本的变量契约校验）</label>
+      <textarea name="inputs_json">{
+  "customer_text": "客服非常耐心，问题一次解决",
+  "lang": "zh",
+  "channel": "app"
+}</textarea>
+      <label>routing_key（可选；放量批次按它做稳定散列分流，留空则走当前构件）</label>
+      <input name="routing_key" placeholder="如 user-10086">
+      <div class="row" style="margin-top:10px"><button>发起线上请求并生成重演页</button></div>
+    </form>
+    <div>
+      <h3>最近线上请求（已固化三元组与摘要）</h3>
+      <table>
+        <thead><tr><th>request_id</th><th>命中版本</th><th>routing_key</th><th>输入摘要</th><th>输出摘要</th><th></th></tr></thead>
+        <tbody>
+        {% for r in requests %}
+          <tr><td class="small mono">{{ r.request_id }}</td>
+            <td class="small mono">{{ r.version_id }}
+              {% if r.rollout_generation %}<div class="chip warn" style="margin-top:2px">放量·代次 {{ r.rollout_generation }}</div>{% endif %}</td>
+            <td class="small mono">{{ r.routing_key }}</td>
+            <td class="small mono">{{ r.input_digest }}</td>
+            <td class="small mono">{{ r.output_digest }}</td>
+            <td><a href="/requests/{{ r.request_id }}/replay">复查</a></td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>

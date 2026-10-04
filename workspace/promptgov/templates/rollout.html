@@ -1,0 +1,166 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/families/{{ family.family_id }}">← 返回 {{ family.name }}</a> ·
+  分批放量：调用方携带 <span class="mono">routing_key</span>，系统用稳定散列把
+  <span class="mono">(批次, key)</span> 映射到 0~99 号桶，桶号 &lt; 权重时走<b>候选构件</b>，
+  否则走<b>当前构件</b>。批次代次不变时同一 key 的路由决定不漂移；
+  升档 / 冻结 / 恢复 / 完成 / 撤销全部以 <span class="mono">expected_generation</span> 做 CAS，
+  失败或冲突不会改变已生效的路由表。
+</div>
+
+{% if current %}
+<div class="card">
+  <h2>进行中的批次
+    {% if current.is_tripped %}<span class="badge b-failed_eval">⛔ frozen · 自动止损触发</span>
+    {% elif current.is_ramping %}<span class="badge b-evaluating">ramping 放量中</span>{% endif %}
+    {% if current.is_frozen %}{% if current.is_tripped %}{% else %}<span class="badge b-approved">frozen 已冻结</span>{% endif %}{% endif %}
+    <a class="chip" href="/rollouts/{{ current.rollout_id }}/stoploss">🛡 止损配置与历史 →</a>
+  </h2>
+  <div class="kv">
+    <div>rollout_id</div><div class="mono">{{ current.rollout_id }}</div>
+    <div>候选构件</div><div><b>v{{ current.candidate_semver }}</b>
+      <span class="mono small">{{ current.candidate_version_id }}</span></div>
+    <div>当前构件（基线）</div><div><b>v{{ current.base_semver }}</b>
+      <span class="mono small">{{ current.base_version_id }}</span></div>
+    <div>分流权重</div><div><b>{{ current.weight }}%</b> 的 key 走候选，其余走当前构件</div>
+    <div>批次代次</div><div class="mono">{{ current.generation }}</div>
+    {% if current.stoploss_cfg %}
+    <div>止损配置</div><div>{{ current.stoploss_cfg.window_seconds }}s 滚动窗口 ·
+      最小样本 {{ current.stoploss_cfg.min_sample }} · 失败上限
+      <span class="mono">{{ current.stoploss_cfg.fail_ratio_limit }}</span></div>
+    {% else %}
+    <div>止损配置</div><div class="warn">尚未配置 ——
+      <a href="/rollouts/{{ current.rollout_id }}/stoploss">立即配置观察窗口/样本门槛/失败上限</a></div>
+    {% endif %}
+    <div>创建</div><div>{{ current.created_at }} · {{ current.created_by }}</div>
+  </div>
+
+  {% if current.is_tripped %}
+  <div class="flash" style="margin-top:14px">
+    ⛔ 本批次被<b>自动止损</b>冻结：越界回执在单事务内冻结了试投，新流量（含本应命中候选的
+    routing_key）已全部回落基线 v{{ current.base_semver }}。普通恢复被禁止——请到
+    <a href="/rollouts/{{ current.rollout_id }}/stoploss">止损页</a>
+    查看触发快照并执行<b>人工恢复</b>（开启新代次 + 重置统计窗口）。
+  </div>
+  {% endif %}
+
+  {% if current.is_tripped %}{% else %}
+  <div class="grid g3" style="margin-top:14px">
+    {% if current.is_ramping %}
+    <form method="post" action="/ui/rollouts/{{ current.rollout_id }}/ramp">
+      <label>升档：新权重（&gt; {{ current.weight }}，≤ 100）</label>
+      <input type="hidden" name="expected_generation" value="{{ current.generation }}">
+      <input name="weight" type="number" min="1" max="100" value="{{ current.next_weight }}" required>
+      <button style="margin-top:8px">升档</button>
+    </form>
+    <form method="post" action="/ui/rollouts/{{ current.rollout_id }}/freeze">
+      <label>冻结：新调用全部回落当前构件</label>
+      <input type="hidden" name="expected_generation" value="{{ current.generation }}">
+      <p class="small">权重保留，恢复后同 key 路由决定与冻结前一致。</p>
+      <button class="ghost">冻结</button>
+    </form>
+    {% endif %}
+    {% if current.is_frozen %}
+    <form method="post" action="/ui/rollouts/{{ current.rollout_id }}/resume">
+      <label>恢复：回到放量态（权重 {{ current.weight }}%）</label>
+      <input type="hidden" name="expected_generation" value="{{ current.generation }}">
+      <p class="small">冻结期间无候选流量；恢复后继续按稳定散列分流。</p>
+      <button style="margin-top:8px">恢复放量</button>
+    </form>
+    {% endif %}
+    <form method="post" action="/ui/rollouts/{{ current.rollout_id }}/complete">
+      <label>完成：候选构件转正（翻转线上指针）</label>
+      <input type="hidden" name="expected_generation" value="{{ current.generation }}">
+      <p class="small">单事务内翻指针 + 终结批次；要求线上指针仍等于基线。</p>
+      <button>完成并转正</button>
+    </form>
+    <form method="post" action="/ui/rollouts/{{ current.rollout_id }}/cancel">
+      <label>撤销：流量全部回归当前构件</label>
+      <input type="hidden" name="expected_generation" value="{{ current.generation }}">
+      <p class="small">线上指针从未移动，撤销即天然回归。</p>
+      <button class="danger">撤销批次</button>
+    </form>
+  </div>
+  {% endif %}
+</div>
+{% else %}
+<div class="card">
+  <h2>建立放量批次（仅已审核构件）</h2>
+  {% if candidates %}
+  <form method="post" action="/ui/families/{{ family.family_id }}/rollouts">
+    <div class="grid g3" style="grid-template-columns:2fr 1fr auto">
+      <div>
+        <label>候选构件（须已通过评估 + release 审批；新增工具须已有专项授权）</label>
+        <select name="candidate_version_id">
+          {% for c in candidates %}
+          <option value="{{ c.version_id }}">v{{ c.semver }} · {{ c.short_hash }} ·
+            {{ c.model_id }} · {{ c.status }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label>初始权重（0~100，候选流量 %）</label>
+        <input name="weight" type="number" min="0" max="100" value="10" required>
+      </div>
+      <div style="align-self:end"><button>建立批次</button></div>
+    </div>
+    <table style="margin-top:10px">
+      <thead><tr><th>候选</th><th>工具扩权门禁（按当前时刻复查）</th></tr></thead>
+      <tbody>
+      {% for c in candidates %}
+      <tr><td class="small mono">v{{ c.semver }} {{ c.version_id }}</td>
+        <td class="small">{% if c.gate.blocked %}<span class="bad">✗ {{ c.gate.text }}</span>
+          {% elif c.gate.expands %}<span class="ok">✓ {{ c.gate.text }}</span>
+          {% else %}<span class="mut">{{ c.gate.text }}</span>{% endif %}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </form>
+  {% else %}
+  <p class="mut">暂无可放量的已审核候选构件（需非线上版本且持有通过的 release 审批）。</p>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="grid g2" style="margin-top:16px">
+  <div class="card">
+    <h2>批次历史</h2>
+    <table>
+      <thead><tr><th>rollout_id</th><th>候选 → 基线</th><th>权重</th><th>状态</th><th>代次</th><th>止损</th><th>更新</th></tr></thead>
+      <tbody>
+      {% for r in rollouts %}
+        <tr>
+          <td class="small mono">{{ r.rollout_id }}</td>
+          <td class="small">v{{ r.candidate_semver }} → v{{ r.base_semver }}</td>
+          <td class="small">{{ r.weight }}%</td>
+          <td><span class="badge b-{{ r.status }}">{{ r.status }}</span>
+            {% if r.is_tripped %}<span class="badge b-failed_eval">止损触发</span>{% endif %}</td>
+          <td class="small mono">{{ r.generation }}</td>
+          <td><a href="/rollouts/{{ r.rollout_id }}/stoploss">配置 / 历史</a></td>
+          <td class="small">{{ r.updated_at }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>最近调用（命中证据已固化，复查不受权重变化影响）</h2>
+    <table>
+      <thead><tr><th>request_id</th><th>routing_key</th><th>命中构件</th><th>批次代次</th><th></th></tr></thead>
+      <tbody>
+      {% for r in requests %}
+        <tr>
+          <td class="small mono">{{ r.request_id }}</td>
+          <td class="small mono">{{ r.routing_key }}</td>
+          <td class="small mono">{{ r.version_id }}
+            {% if r.hit_candidate %}<span class="chip warn">候选</span>{% endif %}</td>
+          <td class="small mono">{{ r.rollout_generation }}</td>
+          <td><a href="/requests/{{ r.request_id }}/replay">复查</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>

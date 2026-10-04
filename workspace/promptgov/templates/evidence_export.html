@@ -1,0 +1,44 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="card">
+  <h2>导出提示治理证据包</h2>
+  <p class="small">导出在<b>同一数据库快照事务</b>标定切点并闭包收集：模板内容、固定测试集、
+    评估证据（逐用例）、审批、线上调用快照、放量批次与事件、止损配置/窗口/触发/回执、
+    相关审计。切点之后继续发生的任何写入都不会进入本包，无悬空引用、无半个状态。
+    归档为确定性分片格式 <span class="mono">.pgpack</span>：清单 + 内容寻址对象，逐项带摘要。</p>
+
+  <form method="post" action="/ui/evidence/exports">
+    <label>选择范围</label>
+    <select name="scope_kind" id="kind">
+      <option value="family" {% if kind == 'family' %}selected{% endif %}>按模板族（该族全部版本/调用/批次/止损的完整闭包）</option>
+      <option value="version" {% if kind == 'version' %}selected{% endif %}>按单个版本（仅勾选版本 + 其评估/审批/测试集 + 命中该版本的调用/回执）</option>
+      <option value="requests" {% if kind == 'requests' %}selected{% endif %}>按调用范围（仅勾选调用 + 命中版本 + 重演/回执）</option>
+    </select>
+    <p class="small mut">按版本/调用范围导出时，未勾选的同族修订版及其请求、放量批次、
+      止损配置/窗口/触发均<b>不会进入证据包</b>；指向它们的活动指针/批次/窗口边在清单
+      <span class="mono">external_refs</span> 中逐项声明为范围边界（不断链、自检可识别），
+      打开所选评估与所选调用复查所需的最小依赖始终完整。</p>
+
+    <label>模板族 family_id（按模板族时使用）</label>
+    <select name="family_id">
+      <option value="">—</option>
+      {% for f in families %}
+      <option value="{{ f.family_id }}" {% if family_id == f.family_id %}selected{% endif %}>
+        {{ f.name }}（{{ f.family_id }}）</option>
+      {% endfor %}
+    </select>
+
+    <label>版本 version_id（按版本时使用，可粘贴完整 id）</label>
+    <input name="version_id" value="{{ version_id }}" placeholder="ver_xxxxxxxxxxxx">
+
+    <label>调用范围 request_ids（按调用范围时使用，逗号分隔）</label>
+    <textarea name="request_ids" placeholder="req_aaa, req_bbb, seed-demo-req-00">{{ request_ids }}</textarea>
+
+    <label>数据分片大小（字节，留空默认 1048576；测试可用小值如 2048 验证分片续传）</label>
+    <input name="shard_size_bytes" placeholder="1048576">
+
+    <label>操作人</label><input name="actor" value="web">
+    <div class="row" style="margin-top:12px"><button>从当前快照切点导出</button>
+      <a class="btn ghost" href="/evidence">返回证据包列表</a></div>
+  </form>
+</div>

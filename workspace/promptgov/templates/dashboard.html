@@ -1,0 +1,72 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="grid g2">
+  <div class="card">
+    <h2>模板族 / 线上版本</h2>
+    <table>
+      <thead><tr><th>模板族</th><th>当前线上完整版本</th><th>版本数</th><th></th></tr></thead>
+      <tbody>
+      {% for f in families %}
+        <tr>
+          <td><a href="/families/{{ f.family_id }}"><b>{{ f.name }}</b></a>
+            <div class="small mono">{{ f.family_id }}</div>
+            <div class="small">{{ f.description }}</div></td>
+          <td>{% if f.active %}<span class="badge b-active">v{{ f.active.semver }}</span>
+              <div class="small mono">hash {{ f.active.short_hash }}</div>
+              <div class="small">模型 {{ f.active.model_id }}</div>
+              {% if f.rollout %}<div style="margin-top:4px">
+                <a href="/families/{{ f.family_id }}/rollout"><span class="chip warn">
+                放量 {{ f.rollout.weight }}% → v{{ f.rollout.candidate_semver }} ·
+                {{ f.rollout.status }}</span></a>
+                {% if f.rollout.is_tripped %}
+                <a href="/rollouts/{{ f.rollout.rollout_id }}/stoploss"><span class="chip"
+                   style="background:rgba(239,91,91,.15);color:var(--bad);border:1px solid rgba(239,91,91,.4)">
+                   ⛔ 自动止损</span></a>
+                {% else %}
+                <a href="/rollouts/{{ f.rollout.rollout_id }}/stoploss"><span class="chip">🛡 止损</span></a>
+                {% endif %}
+              </div>{% endif %}
+            {% else %}<span class="mut">未发布（拒绝线上流量）</span>{% endif %}</td>
+          <td>{{ f.n_versions }}</td>
+          <td><a class="btn ghost" href="/families/{{ f.family_id }}">治理</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+
+    <h3>新建模板族</h3>
+    <form method="post" action="/ui/families" class="grid g3" style="grid-template-columns:1fr 1fr 1.4fr auto">
+      <input name="family_id" placeholder="family_id，如 billing-agent" required>
+      <input name="name" placeholder="展示名称" required>
+      <input name="description" placeholder="说明">
+      <button>创建</button>
+    </form>
+  </div>
+
+  <div class="card" id="models">
+    <h2>模型注册表（线上请求只能绑定已注册模型）</h2>
+    <table>
+      <thead><tr><th>模型标识 model_id</th><th>提供方</th><th>说明</th><th>能力</th></tr></thead>
+      <tbody>
+      {% for m in models %}
+        <tr><td class="mono">{{ m.model_id }}</td><td>{{ m.vendor }}</td>
+          <td>{{ m.label }}</td><td>{{ m.capability }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="small">模型标识写入版本的 model_params._bound_model 并纳入内容指纹：
+      换模型 = 新版本 = 新哈希，重演时与模板变化、输入变化可区分。</p>
+
+    <h3>最近审计事件</h3>
+    <table>
+      <tbody>
+      {% for a in audit %}
+        <tr><td class="small mono">{{ a.created_at }}</td>
+          <td class="small"><b>{{ a.action }}</b></td>
+          <td class="small">{{ a.entity_id }}</td>
+          <td class="small mut">{{ a.detail }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>

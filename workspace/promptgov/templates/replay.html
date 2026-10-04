@@ -1,0 +1,190 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/families/{{ req.family_id }}">← 返回 {{ req.family_name }}</a> ·
+  旧请求始终按<b>原元数据</b>复核，不受当前线上指针与放量批次权重变化影响。
+  原请求固化三元组：版本 <span class="mono small">{{ req.version_id }}</span> ·
+  模型 <span class="mono small">{{ req.model_id }}</span> ·
+  输入摘要 <span class="mono small">{{ req.input_digest }}</span>；
+  模板哈希 <span class="mono small">{{ req.short_template_hash }}</span>。
+  {% if req.rollout_id %}命中放量批次 <span class="mono small">{{ req.rollout_id }}</span>
+  · 代次 <span class="mono small">{{ req.rollout_generation }}</span>。{% endif %}
+</div>
+
+{% if authz.exists %}
+<div class="card">
+  <h2>工具扩权授权快照（命中时固化，历史结论只按此复查）</h2>
+  {% if authz.required %}
+  <div class="kv">
+    <div>命中时状态</div><div><span class="badge b-{{ authz.state_at_check }}">
+      {{ authz.state_at_check }}</span> · 复核时刻
+      <span class="mono small">{{ authz.checked_at }}</span></div>
+    <div>授权记录</div><div class="mono small">{{ authz.approval_id }}
+      （{{ authz.approver }}，版本 v{{ authz.revoke_version }}）</div>
+    <div>授权有效期</div><div>{{ authz.window_text }}
+      {% if authz.is_permanent %}<span class="chip">永久授权（旧审批兼容）</span>{% endif %}</div>
+    <div>新增工具</div><div>{% for t in authz.added_tools %}<span class="chip">{{ t }}</span>
+      {% endfor %}</div>
+    <div>授权覆盖工具</div><div>{% for t in authz.granted_tools %}<span class="chip">{{ t }}</span>
+      {% endfor %}</div>
+    <div>候选全部工具</div><div>{% for t in authz.candidate_tools %}<span class="chip">{{ t }}</span>
+      {% endfor %}</div>
+    <div>当前状态对照</div><div>
+      {% if not authz.current_exists %}<span class="mut">授权记录已不在库中</span>
+      {% else %}<span class="badge b-{{ authz.current_state }}">{{ authz.current_state }}</span>
+        {% if authz.current_remaining %} · 剩余 {{ authz.current_remaining }}{% endif %}
+        {% if authz.current_changed %}<div class="small warn">授权在本次调用之后发生了变化
+          （到期/撤销），但只影响新的建批/命中/转正，不改变本调用的复查结论。</div>
+        {% else %}<div class="small ok">自命中以来授权状态未变化。</div>{% endif %}
+      {% endif %}</div>
+  </div>
+  {% else %}
+  <p class="small">该命中未走扩权复核（命中基线或候选未新增工具），无需授权快照。</p>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if req.rollout_id %}
+<div class="card">
+  <h2>生产推理效果回执（自动止损）
+    <a class="chip" href="/rollouts/{{ req.rollout_id }}/stoploss">止损配置与历史 →</a>
+  </h2>
+  {% if feedback.feedback_id %}
+  <p>本请求已入账回执 <span class="mono">{{ feedback.feedback_id }}</span>：
+    {% if feedback.outcome == 'failure' %}<span class="badge b-failed_eval">failure</span>
+    {% else %}<span class="badge b-active">success</span>{% endif %}
+    · 入账时间 {{ feedback.credited_at }} · 窗口 <span class="mono small">{{ feedback.window_id }}</span></p>
+  <p class="small">同一 feedback_id 与同一 request_id 都只能入账一次，重复提交被拒绝（仅审计）。</p>
+  {% else %}
+  <p class="small">回执只对<b>真实由该试投产生、命中候选构件、属于当前批次代次</b>、
+    在观察窗口内的请求入账；基线请求、旧代次请求、迟到回执只留审计记录。</p>
+  <div class="kv">
+    <div>命中候选构件</div><div>{% if feedback.is_candidate_hit %}<span class="ok">是</span>
+      {% else %}<span class="bad">否（命中基线，回执不会入账）</span>{% endif %}</div>
+    <div>批次代次</div><div>命中 gen {{ feedback.hit_generation }} / 当前
+      gen {{ feedback.current_generation }}
+      {% if feedback.same_generation %}<span class="ok">一致</span>
+      {% else %}<span class="warn">不一致（旧代次请求，仅审计）</span>{% endif %}</div>
+    <div>批次状态</div><div>{{ feedback.rollout_status }}
+      {% if feedback.rollout_tripped %}<span class="badge b-failed_eval">已自动止损</span>{% endif %}</div>
+    <div>止损配置</div><div>{% if feedback.configured %}已配置
+      {% else %}<span class="warn">未配置（回执仅审计）</span>{% endif %}</div>
+  </div>
+  {% if feedback.can_report %}
+  <form method="post" action="/ui/rollouts/{{ feedback.rollout_id }}/feedback"
+        class="grid g3" style="grid-template-columns:2fr 1fr auto;margin-top:12px">
+    <input type="hidden" name="request_id" value="{{ req.request_id }}">
+    <input name="feedback_id" placeholder="feedback_id（业务方回执唯一标识）" required>
+    <select name="outcome">
+      <option value="success">success 成功</option>
+      <option value="failure">failure 失败</option>
+    </select>
+    <button>提交回执</button>
+  </form>
+  {% else %}
+  <p class="small warn" style="margin-top:8px">当前不可提交入账回执（批次非放量态 / 未配置止损 /
+    命中基线或旧代次）；提交也只会写入审计日志，不触发状态变化。</p>
+  {% endif %}
+  {% endif %}
+</div>
+{% endif %}
+
+{% if result %}
+<div class="card">
+  <h2>重演报告</h2>
+  <p style="font-size:16px">结论：
+    {% if result.verdict == 'reproduced' %}<span class="badge b-active">REPRODUCED 完全重演</span>
+    {% elif result.verdict == 'output_drift' %}<span class="badge b-failed_eval">OUTPUT_DRIFT 三元组相同但输出漂移</span>
+    {% elif result.verdict == 'input_changed' %}<span class="badge b-evaluating">INPUT_CHANGED 输入变化</span>
+    {% elif result.verdict == 'model_changed' %}<span class="badge b-approved">MODEL_CHANGED 模型变化</span>
+    {% elif result.verdict == 'template_changed' %}<span class="badge b-superseded">TEMPLATE_CHANGED 模板变化</span>
+    {% else %}<span class="badge b-failed_eval">{{ result.verdict }}</span>{% endif %}
+  </p>
+  <p class="small">模式 {{ result.mode }} · 变化轴 {{ result.changed_axis }}</p>
+  <div class="axis">
+    <div>模板<br>{% if result.same_template %}<span class="ok">一致</span>{% else %}<span class="bad">不同</span>{% endif %}</div>
+    <div>模型<br>{% if result.same_model %}<span class="ok">一致</span>{% else %}<span class="bad">不同</span>{% endif %}</div>
+    <div>输入<br>{% if result.same_input %}<span class="ok">一致</span>{% else %}<span class="bad">不同</span>{% endif %}</div>
+    <div>输出<br>{% if result.same_output %}<span class="ok">一致</span>{% else %}<span class="bad">不同</span>{% endif %}</div>
+  </div>
+  <h3>本次重演输出</h3>
+  <pre>{{ result.replay_output | e }}</pre>
+</div>
+{% endif %}
+
+<div class="grid g2">
+  <div class="card">
+    <h2>原请求存档（不可变）</h2>
+    <div class="kv">
+      <div>request_id</div><div class="mono">{{ req.request_id }}</div>
+      <div>时间</div><div>{{ req.created_at }}</div>
+      <div>命中构件</div><div class="mono">{{ req.version_id }}</div>
+      <div>模型</div><div class="mono">{{ req.model_id }}</div>
+      <div>模板哈希</div><div class="mono">{{ req.template_hash }}</div>
+      <div>输入摘要</div><div class="mono">{{ req.input_digest }}</div>
+      <div>输出摘要</div><div class="mono">{{ req.output_digest }}</div>
+      {% if req.routing_key %}<div>routing_key</div><div class="mono">{{ req.routing_key }}</div>{% endif %}
+      {% if req.rollout_id %}
+      <div>放量批次</div><div class="mono">{{ req.rollout_id }}
+        {% if rollout %}<span class="badge b-{{ rollout.status }}">{{ rollout.status }}</span>{% endif %}</div>
+      <div>命中批次代次</div><div class="mono">{{ req.rollout_generation }}</div>
+      {% endif %}
+      {% if req.params_fingerprint %}<div>参数指纹</div><div class="mono">{{ req.params_fingerprint }}</div>{% endif %}
+    </div>
+    {% if req.params_json %}
+    <h3>调用时推理配置（固化快照）</h3><pre>{{ req.params_json | e }}</pre>
+    {% endif %}
+    <h3>渲染后系统提示</h3><pre>{{ req.rendered_prompt | e }}</pre>
+    <h3>原始输入</h3><pre>{{ req.inputs_json | e }}</pre>
+    <h3>原始输出</h3><pre>{{ req.output | e }}</pre>
+  </div>
+
+  <div class="card">
+    <h2>发起重演 / 反事实归因</h2>
+    <form method="post" action="/ui/requests/{{ req.request_id }}/replay">
+      <label>精确重演（三元组全部保持原样）</label>
+      <p class="small">不改任何覆盖项直接提交，即为按原元数据精确复核。</p>
+
+      <label>反事实①：换模板版本（template 轴）</label>
+      <select name="override_version_id">
+        <option value="">（不覆盖）</option>
+        {% for v in versions %}
+          <option value="{{ v.version_id }}">v{{ v.semver }} · {{ v.short_hash }}
+            {{ '（线上）' if v.is_active else '' }} · {{ v.status }}</option>
+        {% endfor %}
+      </select>
+
+      <label>反事实②：换模型（model 轴）</label>
+      <select name="override_model_id">
+        <option value="">（不覆盖）</option>
+        {% for m in models %}<option value="{{ m.model_id }}">{{ m.model_id }}</option>{% endfor %}
+      </select>
+
+      <label>反事实③：改输入（input 轴，勾选后生效）</label>
+      <input type="checkbox" name="change_inputs" value="1" id="ci" style="width:auto">
+      <label for="ci" style="display:inline">使用下方输入覆盖原输入</label>
+      <textarea name="inputs_json">{{ req.inputs_json }}</textarea>
+
+      <label>运行时漂移注入</label>
+      <input type="checkbox" name="inject_drift" style="width:auto">
+      <span class="small">三元组不变但模拟后端非确定性，应判为 OUTPUT_DRIFT</span>
+
+      <div class="row" style="margin-top:12px"><button>生成重演报告</button></div>
+    </form>
+
+    <h3>历史重演记录</h3>
+    <table>
+      <thead><tr><th>模式</th><th>结论</th><th>轴</th><th>时间</th><th></th></tr></thead>
+      <tbody>
+      {% for r in replays %}
+        <tr><td class="small">{{ r.mode }}</td>
+          <td class="small"><b>{{ r.verdict }}</b></td>
+          <td class="small">{{ r.changed_axis }}</td>
+          <td class="small">{{ r.created_at }}</td>
+          <td><a href="/requests/{{ req.request_id }}/replay?rpl={{ r.replay_id }}">查看</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>

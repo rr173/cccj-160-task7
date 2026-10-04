@@ -1,0 +1,98 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/evidence/packs/{{ pid }}">← 返回证据包</a> ·
+  <span class="chip">只读止损历史（切点快照）</span> ·
+  批次 <b class="mono">{{ ro.rollout_id }}</b>：候选 <b>v{{ ro.candidate_semver }}</b>
+  / 基线 <b>v{{ ro.base_semver }}</b> · 切点状态
+  <span class="badge b-{{ ro.status }}">{{ ro.status }}</span> gen {{ ro.generation }}
+  {% if ro.is_tripped %}<span class="badge b-failed_eval">已自动止损</span>{% endif %}
+</div>
+
+<div class="grid g2">
+  <div class="card">
+    <h2>止损配置（开窗时门槛）</h2>
+    {% if cfg %}
+    <div class="kv">
+      <div>滚动窗口</div><div>{{ cfg.window_seconds }} 秒（按请求产生时间）</div>
+      <div>最小样本</div><div>{{ cfg.min_sample }}</div>
+      <div>失败占比上限</div><div>{{ cfg.fail_ratio_limit }}（严格越过才触发）</div>
+    </div>
+    {% else %}<p class="small mut">该批次未配置止损。</p>{% endif %}
+
+    <h3>统计窗口历史（旧窗口永久保留）</h3>
+    <table>
+      <thead><tr><th>seq</th><th>状态</th><th>样本/失败</th><th>占比/上限</th><th>开启</th></tr></thead>
+      <tbody>
+      {% for w in windows %}
+        <tr><td>{{ w.seq }}</td>
+          <td>{% if w.status == 'tripped' %}<span class="bad">{{ w.status }}</span>
+            {% elif w.status == 'active' %}<span class="warn">{{ w.status }}</span>
+            {% else %}<span class="mut">{{ w.status }}</span>{% endif %}</td>
+          <td class="small">{{ w.total }} / {{ w.fails }}</td>
+          <td class="small">{{ w.fail_pct }} / {{ w.limit_pct }}</td>
+          <td class="small">{{ w.started_at }}</td></tr>
+      {% endfor %}
+      {% if not windows %}<tr><td colspan="5" class="small mut">无统计窗口（惰性开窗，首条回执才开窗）。</td></tr>{% endif %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>止损触发快照（单事务现场）</h2>
+    <table>
+      <thead><tr><th>trigger</th><th>时间</th><th>候选</th><th>代次</th><th>权重</th>
+        <th>失败/样本</th><th>触发回执</th></tr></thead>
+      <tbody>
+      {% for t in triggers %}
+        <tr><td class="small mono">{{ t.trigger_id }}</td>
+          <td class="small">{{ t.created_at }}</td>
+          <td class="small">v{{ t.candidate_semver }}<div class="small mut">基线 v{{ t.base_semver }}</div></td>
+          <td class="small">{{ t.rollout_generation }}</td>
+          <td class="small">{{ t.weight }}%</td>
+          <td class="small bad">{{ t.fail_count }}/{{ t.total_sample }} ({{ t.fail_pct }})</td>
+          <td class="small mono">{{ t.trigger_feedback_id }}</td></tr>
+      {% endfor %}
+      {% if not triggers %}<tr><td colspan="7" class="small mut">未触发过自动止损。</td></tr>{% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="grid g2" style="margin-top:16px">
+  <div class="card">
+    <h2>入账回执明细</h2>
+    <table>
+      <thead><tr><th>feedback</th><th>结果</th><th>调用（点击复查）</th><th>窗口</th>
+        <th>命中</th><th>key</th><th>请求产生</th></tr></thead>
+      <tbody>
+      {% for r in receipts %}
+        <tr><td class="small mono">{{ r.feedback_id }}</td>
+          <td>{% if r.outcome == 'failure' %}<span class="bad">failure</span>
+            {% else %}<span class="ok">success</span>{% endif %}</td>
+          <td><a class="small mono"
+             href="/evidence/packs/{{ pid }}/requests/{{ r.request_id }}/replay">{{ r.request_id }}</a></td>
+          <td class="small">#{{ r.window_seq }}</td>
+          <td class="small">v{{ r.hit_semver }} gen{{ r.hit_generation }}</td>
+          <td class="small mono">{{ r.routing_key }}</td>
+          <td class="small">{{ r.request_created_at }}</td></tr>
+      {% endfor %}
+      {% if not receipts %}<tr><td colspan="7" class="small mut">无入账回执。</td></tr>{% endif %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>被拒 / 重复回执审计流（只写审计，不改状态）</h2>
+    <table>
+      <tbody>
+      {% for r in rejected %}
+        <tr><td class="small mono">{{ r.created_at }}</td>
+          <td class="small"><b>{{ r.action }}</b> <span class="mono">{{ r.entity_id }}</span></td>
+          <td class="small mut">{{ r.detail }}</td></tr>
+      {% endfor %}
+      {% if not rejected %}<tr><td colspan="3" class="small mut">切点前无被拒回执。</td></tr>{% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>

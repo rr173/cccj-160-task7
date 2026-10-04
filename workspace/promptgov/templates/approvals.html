@@ -1,0 +1,61 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  工具扩权审批（<span class="mono">tool_expansion</span>）支持<b>有效期</b>与<b>主动撤销</b>：
+  审批人可设置生效/失效时刻（半开区间 [生效, 失效)，留空=永久授权，兼容旧审批）。
+  创建放量、候选首次命中、一步发布都会按<b>业务请求发生时刻</b>重新确认授权仍有效、
+  且覆盖候选新增的<b>全部</b>工具；尚未生效 / 恰好到期 / 已撤销 / 只覆盖部分工具，
+  任一不满足都不会改变线上指针或放量状态。撤销以 <span class="mono">expected_version</span>
+  做并发控制；撤销后可重新审批产生新记录。已产生的调用按命中时保存的授权快照复查，
+  不因随后到期或撤销改写结论。
+  <div class="small" style="margin-top:6px">当前库时刻：<span class="mono">{{ now }}</span>
+  {% if only_version %} · 仅版本 <span class="mono">{{ only_version }}</span>
+  · <a href="/approvals">查看全部审批</a>{% endif %}</div>
+</div>
+
+<div class="card">
+  <h2>审批历史与操作（{{ approvals | length }} 条）</h2>
+  <table>
+    <thead><tr><th>审批</th><th>版本</th><th>类型</th><th>结论/状态</th><th>覆盖工具</th>
+    <th>有效期</th><th>剩余时间</th><th>审批人/理由</th><th>撤销</th></tr></thead>
+    <tbody>
+    {% for a in approvals %}
+      <tr>
+        <td class="small mono">{{ a.approval_id }}<div class="small">{{ a.created_at }}</div></td>
+        <td class="small"><a href="/versions/{{ a.version_id }}/eval">v{{ a.semver }}</a>
+          <div class="small mut">{{ a.family_name }}</div></td>
+        <td><span class="chip">{{ a.kind }}</span></td>
+        <td>{% if a.decision == 'approved' %}<span class="ok">approved</span>
+          {% else %}<span class="bad">rejected</span>{% endif %}
+          {% if a.decision == 'approved' %}
+          <br><span class="badge b-{{ a.state }}">{{ a.state }}</span>{% endif %}</td>
+        <td class="small mono">{% for t in a.granted_tool_list %}<span class="chip">{{ t }}</span>
+          {% endfor %}</td>
+        <td class="small">{{ a.window_text }}
+          {% if a.valid_from %}<div class="small mut">from {{ a.valid_from }}</div>{% endif %}
+          {% if a.valid_until %}<div class="small mut">until {{ a.valid_until }}</div>{% endif %}
+          {% if a.revoked_at %}<div class="bad">撤销于 {{ a.revoked_at }} · {{ a.revoked_by }}
+            <div class="small">{{ a.revoke_reason }}</div></div>{% endif %}</td>
+        <td class="small">{% if a.state == 'approved' %}{{ a.remaining_human }}
+          {% elif a.state == 'pending' %}<span class="warn">{{ a.wait_human }} 后生效</span>
+          {% elif a.state == 'permanent' %}∞ 永久{% else %}—{% endif %}
+          <div class="small mut">v{{ a.revoke_version }}</div></td>
+        <td class="small">{{ a.approver }}<div class="small mut">{{ a.reason }}</div></td>
+        <td>{% if a.can_revoke %}
+          <form method="post" action="/ui/approvals/{{ a.approval_id }}/revoke"
+                onsubmit="return confirm('确认提前撤销该授权？')">
+            <input type="hidden" name="expected_version" value="{{ a.revoke_version }}">
+            <input type="hidden" name="back"
+                   value="{% if only_version %}/versions/{{ a.version_id }}/eval{% else %}/approvals{% endif %}">
+            <input name="reason" placeholder="撤销理由（可选）">
+            <button class="danger" style="margin-top:6px">提前撤销</button>
+          </form>
+          {% elif a.state == 'revoked' %}<span class="bad">已撤销</span>
+          {% elif a.state == 'expired' %}<span class="mut">已到期</span>
+          {% else %}<span class="mut">—</span>{% endif %}</td>
+      </tr>
+    {% endfor %}
+    {% if not approvals %}<tr><td colspan="9" class="small mut">暂无审批记录。</td></tr>{% endif %}
+    </tbody>
+  </table>
+</div>
