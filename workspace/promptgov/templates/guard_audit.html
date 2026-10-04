@@ -1,0 +1,60 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+<div class="note">
+  敏感隔离逐请求审计：规则版本变更、请求阻断、还原凭据签发/成功/失败（未授权、过期、
+  重复使用、令牌错误）。所有明细<b>不含原值与令牌明文</b>。
+</div>
+
+<div class="card">
+  <h2>还原凭据与还原尝试（单次短期凭据全生命周期）</h2>
+  <table>
+    <thead><tr><th>时间</th><th>请求</th><th>复核人</th><th>结论</th><th>凭据/明细</th></tr></thead>
+    <tbody>
+    {% for r in reveals %}
+      <tr>
+        <td class="small">{{ r.created_at }}</td>
+        <td class="small mono"><a href="/requests/{{ r.request_id }}/replay">{{ r.request_id }}</a></td>
+        <td class="small">{{ r.reviewer }}</td>
+        <td>{% if r.result == 'revealed' %}<span class="badge b-active">revealed 已还原（凭据消费）</span>
+          {% elif r.result == 'issued' %}<span class="badge b-approved">issued 已签发</span>
+          {% elif r.result == 'denied_unauthorized' %}<span class="badge b-rejected">未授权/授权撤销</span>
+          {% elif r.result == 'denied_expired' %}<span class="badge b-expired">凭据过期</span>
+          {% elif r.result == 'denied_reused' %}<span class="badge b-revoked">重复使用被拒</span>
+          {% else %}<span class="badge b-draft">{{ r.result }}</span>{% endif %}</td>
+        <td class="small mono">{{ r.credential_id }}<div class="small mut">{{ r.detail }}</div></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="grid g2" style="margin-top:16px">
+  <div class="card">
+    <h2>阻断记录</h2>
+    <table>
+      <thead><tr><th>时间</th><th>模板族</th><th>请求</th><th>规则/版本</th><th>字段</th></tr></thead>
+      <tbody>
+      {% for b in blocks %}
+        <tr><td class="small">{{ b.created_at }}</td>
+          <td class="small"><a href="/families/{{ b.family_id }}/guard">{{ b.family_id }}</a></td>
+          <td class="small mono">{{ b.request_id }}</td>
+          <td class="small">{{ b.rule_id }} <span class="chip">v{{ b.version }}</span></td>
+          <td class="small">{{ b.fields }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>相关审计流</h2>
+    <table>
+      <thead><tr><th>时间</th><th>动作</th><th>实体</th><th>明细</th></tr></thead>
+      <tbody>
+      {% for a in items %}
+        <tr><td class="small">{{ a.created_at }}</td>
+          <td class="small mono">{{ a.action }}</td>
+          <td class="small">{{ a.entity }}/{{ a.entity_id }}</td>
+          <td class="small">{{ a.detail }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>

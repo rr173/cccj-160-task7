@@ -1,0 +1,182 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/families/{{ family.family_id }}">← 返回 {{ family.name }}</a> ·
+  敏感内容隔离规则按<b>模板族</b>配置，每次保存生成不可变<b>规则版本</b>；
+  线上请求、评估回放、证据包复核共用同一确定版本。规则更新只影响<b>之后</b>的新请求，
+  在途与历史请求永远按其固化版本与遮盖映射复核。被替换原值仅加密保存，
+  数据库审计与导出文件均不含明文。
+</div>
+
+<div class="grid g2">
+  <div class="card">
+    <h2>当前生效规则版本</h2>
+    {% if active %}
+    <div class="kv">
+      <div>规则版本</div><div>v{{ active.version }}
+        <span class="badge b-active">active</span></div>
+      <div>ruleset_id</div><div class="mono small">{{ active.ruleset_id }}</div>
+      <div>内容哈希</div><div class="mono small">{{ active.short_hash }}</div>
+      <div>规则数</div><div>{{ active.rule_count }}</div>
+      <div>生效时间</div><div>{{ active.activated_at }}</div>
+    </div>
+    <table style="margin-top:10px">
+      <thead><tr><th>id</th><th>类型</th><th>策略</th><th>作用字段</th><th>模式</th><th>占位</th></tr></thead>
+      <tbody>
+      {% for r in active.rules %}
+        <tr>
+          <td class="small">{{ r.id }}{% if r.name %}<div class="small mut">{{ r.name }}</div>{% endif %}</td>
+          <td><span class="chip">{{ r.kind }}</span></td>
+          <td>{% if r.is_block %}<span class="badge b-rejected">拒绝</span>
+            {% else %}<span class="badge b-evaluated">替换</span>{% endif %}</td>
+          <td class="small">{{ r.fields }}</td>
+          <td class="small mono">{{ r.pattern }}</td>
+          <td class="small mono">{{ r.token }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="warn">该模板族尚未启用任何隔离规则版本（新请求暂不隔离）。</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>配置新规则版本</h2>
+    <form method="post" action="/ui/families/{{ family.family_id }}/guard/rulesets">
+      <label>规则（JSON 数组：id / kind=regex|keyword / action=mask|block /
+        pattern / fields / token（替换策略必填）/ name）</label>
+      <textarea name="rules" style="min-height:220px">{{ default_rules }}</textarea>
+      <label>备注</label>
+      <input name="note" placeholder="本版本变更说明（写入审计）">
+      <label class="small" style="display:flex;align-items:center;gap:8px">
+        <input type="checkbox" name="activate" value="1" checked style="width:auto">
+        保存并立即生效（翻转族规则指针；不影响在途/历史请求）
+      </label>
+      <div class="row" style="margin-top:10px"><button>保存规则版本</button></div>
+    </form>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>隔离预览（不落库、不写审计）</h2>
+  <form method="post" action="/ui/families/{{ family.family_id }}/guard/preview" class="grid g2">
+    <div>
+      <label>待检查输入（JSON）</label>
+      <textarea name="inputs_json" style="min-height:150px">{
+  "customer_text": "我的手机号 13812345678，这是内部机密请勿外传",
+  "lang": "zh"
+}</textarea>
+    </div>
+    <div>
+      <label>临时规则（可选；留空＝用当前生效版本预览）</label>
+      <textarea name="rules" style="min-height:150px" placeholder="留空：按当前生效规则版本预览"></textarea>
+    </div>
+    <div class="row" style="grid-column:1/-1"><button class="ghost">执行预览</button></div>
+  </form>
+  {% if preview %}
+  <div style="margin-top:12px">
+    {% if preview.configured %}
+    <p class="small">规则版本 v{{ preview.ruleset_version }}
+      <span class="mono small">{{ preview.ruleset_id }}</span> ·
+      哈希 <span class="mono small">{{ preview.ruleset_hash }}</span></p>
+    {% if preview.blocked %}
+    <div class="flash">⛔ 命中<b>拒绝</b>规则
+      <span class="mono">{{ preview.blocked.rule_id }}</span>
+      （{{ preview.blocked.name }}），字段
+      {% for f in preview.blocked.fields %}<span class="chip">{{ f }}</span>{% endfor %}
+      命中 {{ preview.blocked.match_count }} 处；线上请求将被 403 阻断，不进入渲染。</div>
+    {% else %}
+    <div class="kv">
+      <div>替换占位</div><div>{{ preview.masked_count }} 处
+        {% for t in preview.tokens %}<span class="chip">{{ t.token }}</span>{% endfor %}</div>
+    </div>
+    <h3>替换后的输入（将参与模板渲染）</h3>
+    <pre>{{ preview.masked_inputs | tojson }}</pre>
+    {% endif %}
+    {% else %}
+    <p class="mut">当前无生效规则版本，输入原样返回（未隔离）。</p>
+    <pre>{{ preview.masked_inputs | tojson }}</pre>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+
+<div class="grid g2" style="margin-top:16px">
+  <div class="card">
+    <h2>复核人授权（可签发短期还原凭据）</h2>
+    <form method="post" action="/ui/families/{{ family.family_id }}/guard/grants"
+          class="grid g3" style="grid-template-columns:1fr 1fr auto">
+      <input name="reviewer" placeholder="复核人标识，如 auditor-zhang" required>
+      <input name="reason" placeholder="授权理由">
+      <button>授权</button>
+    </form>
+    <table style="margin-top:10px">
+      <thead><tr><th>复核人</th><th>授权人</th><th>状态</th><th>版本号</th><th></th></tr></thead>
+      <tbody>
+      {% for g in grants %}
+        <tr>
+          <td class="small"><b>{{ g.reviewer }}</b><div class="small mut">{{ g.reason }}</div></td>
+          <td class="small">{{ g.granted_by }}</td>
+          <td>{% if g.revoked %}<span class="badge b-revoked">已撤销 · {{ g.revoked_at }}</span>
+            {% else %}<span class="badge b-active">有效</span>{% endif %}</td>
+          <td class="small mono">v{{ g.revoke_version }}</td>
+          <td>{% if not g.revoked %}
+            <form method="post" action="/ui/guard/grants/{{ g.grant_id }}/revoke"
+                  style="display:flex;gap:4px">
+              <input type="hidden" name="expected_version" value="{{ g.revoke_version }}">
+              <input name="reason" placeholder="撤销理由" style="font-size:11px">
+              <button class="danger" style="padding:4px 8px">撤销</button>
+            </form>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>最近阻断记录（无明文）</h2>
+    {% if blocked %}
+    <table>
+      <thead><tr><th>request_id</th><th>规则</th><th>版本</th><th>字段</th><th>时间</th></tr></thead>
+      <tbody>
+      {% for b in blocked %}
+        <tr><td class="small mono">{{ b.request_id }}</td>
+          <td class="small">{{ b.rule_id }}</td>
+          <td class="small">v{{ b.version }}</td>
+          <td class="small">{{ b.fields }}</td>
+          <td class="small">{{ b.created_at }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="small mut">暂无阻断记录。</p>
+    {% endif %}
+    <p class="small" style="margin-top:8px"><a href="/guard/audit">查看全局逐请求隔离审计 →</a></p>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>规则版本历史（不可变）</h2>
+  <table>
+    <thead><tr><th>版本</th><th>状态</th><th>哈希</th><th>规则数</th><th>备注</th><th>创建</th><th></th></tr></thead>
+    <tbody>
+    {% for r in rulesets %}
+      <tr>
+        <td class="small"><b>v{{ r.version }}</b></td>
+        <td><span class="badge b-{{ r.status }}">{{ r.status }}</span></td>
+        <td class="small mono">{{ r.short_hash }}</td>
+        <td class="small">{{ r.rule_count }}</td>
+        <td class="small">{{ r.note }}</td>
+        <td class="small">{{ r.created_at }}<div class="mut">{{ r.created_by }}</div></td>
+        <td>{% if r.can_activate %}
+          <form method="post" action="/ui/guard/rulesets/{{ r.ruleset_id }}/activate">
+            <input type="hidden" name="expected_active_ruleset_id"
+                   value="{{ active.ruleset_id if active else '' }}">
+            <button class="ghost" style="padding:4px 8px">生效</button>
+          </form>{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>

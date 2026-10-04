@@ -1,0 +1,26 @@
+<div class="note">
+  <b>原值已还原（凭据 {{ credential_id }} 已消费）。</b>
+  请求 <span class="mono">{{ rid }}</span> · 复核人 <b>{{ reviewer }}</b> ·
+  消费时刻 {{ consumed_at }}。本页内容<b>不写库、不出现在导出文件</b>；
+  再次使用同一凭据会被拒绝（单次有效）。
+</div>
+<div class="card">
+  <h2>逐占位符原值</h2>
+  <table>
+    <thead><tr><th>占位符</th><th>规则</th><th>字段</th><th>路径</th><th>原值（仅本次展示）</th></tr></thead>
+    <tbody>
+    {% for v in values %}
+      <tr><td class="small mono">{{ v.token }}</td>
+        <td class="small">{{ v.rule_id }}</td>
+        <td class="small">{{ v.field }}</td>
+        <td class="small">{{ v.path }}</td>
+        <td class="mono">{{ v.value }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <h3>还原后的原始输入（不入库）</h3>
+  <pre>{{ raw_inputs | e }}</pre>
+  <div class="row" style="margin-top:10px">
+    <a class="btn ghost" href="/requests/{{ rid }}/replay">返回请求复核页（凭据已失效）</a>
+  </div>
+</div>

@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS families (
     name             TEXT NOT NULL,
     description      TEXT NOT NULL DEFAULT '',
     active_version_id TEXT,                 -- 当前线上唯一指针，NULL=未发布
+    active_guard_ruleset_id TEXT,            -- 当前生效的敏感隔离规则版本，NULL=未配置
     updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -92,6 +93,11 @@ CREATE TABLE IF NOT EXISTS eval_runs (
     total            INTEGER NOT NULL DEFAULT 0,
     passed           INTEGER NOT NULL DEFAULT 0,
     late             INTEGER NOT NULL DEFAULT 0,  -- 提交时版本是否已离开 evaluated 候选态
+    -- 评估开始时族上生效的敏感隔离规则版本（与线上请求同一规则来源；历史评估
+    -- 永远按此版本复核）；NULL=评估时该族未配置隔离。
+    guard_ruleset_id TEXT,
+    guard_ruleset_version INTEGER,
+    guard_ruleset_hash TEXT NOT NULL DEFAULT '',
     note             TEXT NOT NULL DEFAULT '',
     created_at       TEXT NOT NULL DEFAULT (datetime('now')),
     finished_at      TEXT
@@ -131,6 +137,13 @@ CREATE TABLE IF NOT EXISTS requests (
     -- 结论/覆盖工具/有效期/撤销状态/复查时刻）。之后复查只按本快照，不随后续
     -- 到期或撤销改写结论；NULL = 该命中未走权限扩大复核（基线/未扩大候选/旧调用）。
     authz_snapshot_json TEXT NOT NULL DEFAULT '',
+    -- 敏感内容隔离：请求在写事务内固定的规则版本与遮盖映射；规则更新不改变
+    -- 在途/历史请求的版本与遮盖结果（映射明细见 guard_request_masks）。
+    guard_ruleset_id TEXT,
+    guard_ruleset_version INTEGER,
+    guard_ruleset_hash TEXT NOT NULL DEFAULT '',
+    raw_input_digest TEXT NOT NULL DEFAULT '',  -- 隔离前原始输入摘要（重复请求判定）
+    guard_status TEXT NOT NULL DEFAULT 'none',  -- none / clean / masked
     created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -286,6 +299,124 @@ CREATE TABLE IF NOT EXISTS evidence_imports (
     committed_at         TEXT
 );
 
+-- ============================================================ 敏感内容隔离（Guard）
+-- 规则按**模板族**配置；每次配置生成不可变的规则版本（ruleset），族上的唯一
+-- 指针 families.active_guard_ruleset_id 决定新请求所用版本。线上请求在进入写
+-- 事务时把规则版本号与内容哈希固化进 requests，之后规则更新（新版本+翻指针）
+-- 不影响任何在途/历史请求——评估回放、证据包复核共用同一确定版本。
+CREATE TABLE IF NOT EXISTS guard_rulesets (
+    ruleset_id       TEXT PRIMARY KEY,
+    family_id        TEXT NOT NULL REFERENCES families(family_id),
+    version          INTEGER NOT NULL,         -- 族内单调递增的规则版本号
+    rules_json       TEXT NOT NULL,            -- 规范化规则数组（不可变）
+    content_hash     TEXT NOT NULL,            -- 规则集内容哈希（复核/证据校验重算）
+    status           TEXT NOT NULL DEFAULT 'draft',  -- draft / active / superseded
+    note             TEXT NOT NULL DEFAULT '',
+    created_by       TEXT NOT NULL DEFAULT 'api',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    activated_at     TEXT,
+    UNIQUE(family_id, version)
+);
+
+-- 隔离复核人授权：哪些复核人可以为哪个模板族签发短期还原凭据（可撤销，CAS）。
+CREATE TABLE IF NOT EXISTS guard_reviewer_grants (
+    grant_id         TEXT PRIMARY KEY,
+    family_id        TEXT NOT NULL REFERENCES families(family_id),
+    reviewer         TEXT NOT NULL,
+    granted_by       TEXT NOT NULL,
+    revoke_version   INTEGER NOT NULL DEFAULT 1,
+    revoked_at       TEXT,
+    revoked_by       TEXT NOT NULL DEFAULT '',
+    reason           TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 每个被隔离请求一张遮盖映射（不含明文，也不含密文；密文在 guard_secrets）。
+-- 随请求固化规则版本/哈希、逐占位符的规则与字段位置、动作统计、原始输入摘要。
+CREATE TABLE IF NOT EXISTS guard_request_masks (
+    request_id       TEXT PRIMARY KEY REFERENCES requests(request_id),
+    ruleset_id       TEXT NOT NULL,
+    ruleset_version  INTEGER NOT NULL,
+    ruleset_hash     TEXT NOT NULL,
+    raw_input_digest TEXT NOT NULL,            -- 原始输入（隔离前）摘要：重复请求判定
+    tokens_json      TEXT NOT NULL,            -- [{token,rule_id,kind,field,path}]
+    actions_json     TEXT NOT NULL,            -- {masked: n, blocked: n, rules:[...]}
+    output_actions_json TEXT NOT NULL DEFAULT '[]', -- 输出侧遮盖记录
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 原始明文值的唯一存放处：确定性加密的密文。不进证据包（导出/复核不携带还原
+-- 能力），数据库其他任何列都不得出现被遮盖原值。
+CREATE TABLE IF NOT EXISTS guard_secrets (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id       TEXT NOT NULL REFERENCES requests(request_id),
+    token            TEXT NOT NULL,            -- 遮盖占位符（映射键，本身不含原值）
+    ciphertext       BLOB NOT NULL,            -- ⟨iv|ct|tag⟩，主密钥不落库
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(request_id, token)
+);
+
+-- 还原凭据：绑定单个请求、绑定复核人、短期有效、单次消费。库里只存令牌哈希。
+CREATE TABLE IF NOT EXISTS guard_credentials (
+    credential_id    TEXT PRIMARY KEY,
+    request_id       TEXT NOT NULL REFERENCES requests(request_id),
+    family_id        TEXT NOT NULL,
+    reviewer         TEXT NOT NULL,
+    grant_id         TEXT NOT NULL,
+    token_hash       TEXT NOT NULL UNIQUE,     -- 只存令牌 SHA-256；明文仅返回一次
+    ttl_seconds      INTEGER NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'issued', -- issued / consumed / revoked
+    issued_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at       TEXT NOT NULL,
+    consumed_at      TEXT
+);
+
+-- 被策略拒绝（阻断）的请求本身不产生 requests 行；单独留审计式记录用于重复
+-- 请求给出确定结论与逐请求追溯（明细只含规则标识/字段/计数，绝无原值）。
+CREATE TABLE IF NOT EXISTS guard_block_log (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id       TEXT NOT NULL,
+    family_id        TEXT NOT NULL,
+    ruleset_id       TEXT NOT NULL,
+    ruleset_version  INTEGER NOT NULL,
+    ruleset_hash     TEXT NOT NULL,
+    raw_input_digest TEXT NOT NULL,
+    rule_id          TEXT NOT NULL,
+    rule_name        TEXT NOT NULL DEFAULT '',
+    kind             TEXT NOT NULL,
+    fields_json      TEXT NOT NULL DEFAULT '[]',
+    match_count      INTEGER NOT NULL DEFAULT 1,
+    actor            TEXT NOT NULL DEFAULT 'api',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(request_id, raw_input_digest)
+);
+
+-- 还原审计：签发、成功还原、以及每一次失败（未授权/过期/重复/令牌错误）。
+-- 明细绝不写入任何原值。
+CREATE TABLE IF NOT EXISTS guard_reveals (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id       TEXT NOT NULL,
+    credential_id    TEXT NOT NULL DEFAULT '',
+    reviewer         TEXT NOT NULL DEFAULT '',
+    result           TEXT NOT NULL,            -- issued / revealed / denied_unauthorized /
+                                               -- denied_expired / denied_reused / denied_token
+    detail           TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 评估回放隔离记录：eval_run 固定规则版本，逐用例固化遮盖/阻断统计
+-- （规则更新不改变历史评估的复核结论；明细不含原值）。
+CREATE TABLE IF NOT EXISTS guard_eval_fixtures (
+    run_id           TEXT PRIMARY KEY REFERENCES eval_runs(run_id),
+    ruleset_id       TEXT,                     -- 评估时族上无规则版本则为 NULL（不隔离）
+    ruleset_version  INTEGER,
+    ruleset_hash     TEXT NOT NULL DEFAULT '',
+    cases_json       TEXT NOT NULL,            -- 逐用例 [{seq, masked, blocked, output_masked}]
+    masked_total     INTEGER NOT NULL DEFAULT 0,
+    blocked_total    INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- 证据包审计：每个实例各自记录本包在本地的导出/导入/校验/冲突事件
 -- （来源实例与导出切点保存在清单中，包内还固化了切点前的来源 audit_log）。
 CREATE TABLE IF NOT EXISTS evidence_audit (
@@ -336,6 +467,37 @@ _APPROVALS_NEW_COLUMNS = {
     "revoke_reason": "ALTER TABLE approvals ADD COLUMN revoke_reason TEXT NOT NULL DEFAULT ''",
 }
 
+# 老库增量迁移：families 的敏感隔离规则指针
+_FAMILIES_NEW_COLUMNS = {
+    "active_guard_ruleset_id":
+        "ALTER TABLE families ADD COLUMN active_guard_ruleset_id TEXT",
+}
+
+# 老库增量迁移：requests 的敏感隔离固化列（无规则版本的旧调用一律为默认值）
+_REQUESTS_GUARD_COLUMNS = {
+    "guard_ruleset_id":
+        "ALTER TABLE requests ADD COLUMN guard_ruleset_id TEXT",
+    "guard_ruleset_version":
+        "ALTER TABLE requests ADD COLUMN guard_ruleset_version INTEGER",
+    "guard_ruleset_hash":
+        "ALTER TABLE requests ADD COLUMN guard_ruleset_hash TEXT NOT NULL DEFAULT ''",
+    "raw_input_digest":
+        "ALTER TABLE requests ADD COLUMN raw_input_digest TEXT NOT NULL DEFAULT ''",
+    "guard_status":
+        "ALTER TABLE requests ADD COLUMN guard_status TEXT NOT NULL DEFAULT 'none'",
+    # none（未启用隔离）/ masked（发生遮盖）/ clean（扫描无命中）
+}
+
+# 老库增量迁移：eval_runs 固定所用隔离规则版本
+_EVALRUNS_GUARD_COLUMNS = {
+    "guard_ruleset_id":
+        "ALTER TABLE eval_runs ADD COLUMN guard_ruleset_id TEXT",
+    "guard_ruleset_version":
+        "ALTER TABLE eval_runs ADD COLUMN guard_ruleset_version INTEGER",
+    "guard_ruleset_hash":
+        "ALTER TABLE eval_runs ADD COLUMN guard_ruleset_hash TEXT NOT NULL DEFAULT ''",
+}
+
 _lock = threading.Lock()
 _tls = threading.local()
 
@@ -366,6 +528,24 @@ def init_db() -> None:
             for col, ddl in _APPROVALS_NEW_COLUMNS.items():
                 if col not in acols:
                     conn.execute(ddl)
+            fcols = {r["name"] for r in conn.execute("PRAGMA table_info(families)")}
+            for col, ddl in _FAMILIES_NEW_COLUMNS.items():
+                if col not in fcols:
+                    conn.execute(ddl)
+            rgcols = {r["name"] for r in conn.execute("PRAGMA table_info(requests)")}
+            for col, ddl in _REQUESTS_GUARD_COLUMNS.items():
+                if col not in rgcols:
+                    conn.execute(ddl)
+            egcols = {r["name"] for r in conn.execute("PRAGMA table_info(eval_runs)")}
+            for col, ddl in _EVALRUNS_GUARD_COLUMNS.items():
+                if col not in egcols:
+                    conn.execute(ddl)
+            # 预置敏感隔离实例主密钥（app_meta）：避免首次请求在写事务内惰性建键
+            # 导致嵌套 BEGIN；密钥值随机，只存库（也可由 PROMPTGOV_GUARD_KEY 覆盖）。
+            import secrets as _sec
+            conn.execute(
+                "INSERT OR IGNORE INTO app_meta(key,value) VALUES ('guard_key',?)",
+                (_sec.token_hex(32),))
             conn.commit()
         finally:
             conn.close()

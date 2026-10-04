@@ -5,6 +5,7 @@
   固定测试集：<b>{{ testset_name }}</b>（{{ case_count }} 条，不可变）。
   线上指针在<b>单事务</b>中翻转，热更新 / 回滚并发时用 CAS 保证流量只看到一个完整版本。
   <a href="/families/{{ family.family_id }}/rollout"><b>分批放量 →</b></a>
+  <a href="/families/{{ family.family_id }}/guard"><b>敏感隔离 →</b></a>
   {% if rollout %}<span class="chip warn">放量中：{{ rollout.weight }}% → 候选 · 代次 {{ rollout.generation }}</span>{% endif %}
   <a class="chip" href="/evidence/export?kind=family&family_id={{ family.family_id }}">📦 导出本族证据包 →</a>
 </div>

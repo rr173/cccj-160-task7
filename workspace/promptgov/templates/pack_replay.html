@@ -40,8 +40,51 @@
 </div>
 {% endif %}
 
-{% if req.rollout_id %}
+{% if guardpack %}
 <div class="card">
+  <h2>敏感内容隔离（归档固化版本，包内无密文/凭据，不能还原原值）</h2>
+  <div class="kv">
+    <div>隔离状态</div><div><span class="badge b-evaluating">{{ guardpack.status }}</span></div>
+    <div>固定规则版本</div><div>v{{ guardpack.ruleset_version }}
+      <span class="mono small">{{ guardpack.ruleset_id }}</span>
+      <span class="chip">{{ guardpack.short_hash }}</span>
+      {% if guardpack.hash_ok %}<span class="ok small">哈希与包内规则一致 ✓</span>
+      {% else %}<span class="bad small">哈希不一致</span>{% endif %}</div>
+    <div>原始输入摘要</div><div class="mono small">{{ guardpack.raw_input_digest }}</div>
+    <div>遮盖占位</div><div>{{ guardpack.masked }} 个 · 输出侧再遮盖
+      {{ guardpack.output_masked }} 处</div>
+  </div>
+  {% if guardpack.has_tokens %}
+  <table style="margin-top:8px">
+    <thead><tr><th>占位符</th><th>规则</th><th>字段</th><th>路径</th></tr></thead>
+    <tbody>
+    {% for t in guardpack.tokens %}
+      <tr><td class="mono small">{{ t.token }}</td>
+        <td class="small">{{ t.rule_id }}</td>
+        <td class="small">{{ t.field }}</td>
+        <td class="small">{{ t.path }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  {% if guardpack.rules %}
+  <h3>固定规则版本内容（不可变）</h3>
+  <table>
+    <thead><tr><th>id</th><th>类型</th><th>策略</th><th>字段</th><th>模式</th></tr></thead>
+    <tbody>
+    {% for r in guardpack.rules %}
+      <tr><td class="small">{{ r.id }}</td><td class="small">{{ r.kind }}</td>
+        <td class="small">{{ r.action }}</td>
+        <td class="small">{% for f in r.fields %}<span class="chip">{{ f }}</span>{% endfor %}</td>
+        <td class="small mono">{{ r.pattern }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if req.rollout_id %}<div class="card">
   <h2>生产推理效果回执（归档快照）
     {% if rollout %}<a class="chip"
        href="/evidence/packs/{{ pid }}/rollouts/{{ req.rollout_id }}/stoploss">止损历史 →</a>{% endif %}

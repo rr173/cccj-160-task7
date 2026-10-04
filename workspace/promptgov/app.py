@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from . import config, evidence, llm, services
+from . import config, evidence, guard, llm, services
 from .db import audit, get_conn, init_db
 from .jinja_compat import render_text
 
@@ -214,6 +214,14 @@ class Handler(BaseHTTPRequestHandler):
     def _err(self, exc: Exception):
         if isinstance(exc, evidence.VerificationRejected):
             code = 422
+        elif isinstance(exc, (guard.GuardUnauthorized, guard.GuardExpired)):
+            code = 403
+        elif isinstance(exc, guard.GuardBlocked):
+            code = 403
+        elif isinstance(exc, (guard.GuardReused, guard.GuardConflict)):
+            code = 409
+        elif isinstance(exc, guard.GuardDomain):
+            code = 400
         elif isinstance(exc, services.NotFound):
             code = 404
         elif isinstance(exc, services.Conflict):
@@ -223,7 +231,12 @@ class Handler(BaseHTTPRequestHandler):
         else:
             code = 500
             traceback.print_exc()
-        self._json({"error": type(exc).__name__, "message": str(exc)}, code)
+        body = {"error": type(exc).__name__, "message": str(exc)}
+        if isinstance(exc, guard.GuardBlocked):
+            body["blocked"] = {"rule_id": exc.rule_id, "kind": exc.kind,
+                               "fields": exc.fields,
+                               "ruleset_version": exc.ruleset_version}
+        self._json(body, code)
 
     # ------------------------------------------------------------ 路由
     def do_GET(self):  # noqa: N802
@@ -247,6 +260,8 @@ class Handler(BaseHTTPRequestHandler):
             self._route("POST")
         except Exception as exc:  # noqa: BLE001
             if getattr(self, "_is_page", False):
+                # 阻断/凭据类异常已经自行渲染页面（issue/reveal）；其余表单动作
+                # 回到来源页提示（Guard 异常同样以错误信息展示，不泄露原值）。
                 referer = self.headers.get("Referer", "/")
                 self._redirect(referer.split("?")[0] + "?err=" + quote(str(exc)[:200]))
             else:
@@ -271,6 +286,11 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/families/([\w.-]+)", p)
         if method == "GET" and m:
             return self._page_family(m.group(1), q)
+        m = re.fullmatch(r"/families/([\w.-]+)/guard", p)
+        if method == "GET" and m:
+            return self._page_family_guard(m.group(1), q)
+        if method == "GET" and p == "/guard/audit":
+            return self._page_guard_audit(q)
         m = re.fullmatch(r"/versions/([\w.-]+)/eval", p)
         if method == "GET" and m:
             return self._page_eval(m.group(1), q)
@@ -346,6 +366,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._ui_commit_import(p.split("/")[-2])
         if method == "POST" and re.fullmatch(r"/ui/evidence/imports/[\w.-]+/abort", p):
             return self._ui_abort_import(p.split("/")[-2])
+
+        # ------------------------------------------------ Guard UI 表单动作
+        if method == "POST" and re.fullmatch(r"/ui/families/[\w.-]+/guard/rulesets", p):
+            return self._ui_guard_create_ruleset(p.split("/")[3])
+        if method == "POST" and re.fullmatch(r"/ui/guard/rulesets/[\w.-]+/activate", p):
+            return self._ui_guard_activate(p.split("/")[-2])
+        if method == "POST" and re.fullmatch(r"/ui/families/[\w.-]+/guard/preview", p):
+            return self._ui_guard_preview(p.split("/")[3])
+        if method == "POST" and re.fullmatch(r"/ui/families/[\w.-]+/guard/grants", p):
+            return self._ui_guard_grant(p.split("/")[3])
+        if method == "POST" and re.fullmatch(r"/ui/guard/grants/[\w.-]+/revoke", p):
+            return self._ui_guard_revoke_grant(p.split("/")[-2])
+        if method == "POST" and re.fullmatch(r"/ui/requests/[\w.-]+/reveal-credential", p):
+            return self._ui_guard_issue(p.split("/")[-2])
+        if method == "POST" and re.fullmatch(r"/ui/requests/[\w.-]+/reveal", p):
+            return self._ui_guard_reveal(p.split("/")[-2])
 
         # ------------------------------------------------ JSON API
         if method == "GET" and p == "/api/models":
@@ -529,6 +565,73 @@ class Handler(BaseHTTPRequestHandler):
                 bool(b.get("inject_drift", False))), 201)
         if method == "GET" and p == "/api/requests":
             return self._json(services.list_requests(q.get("family", [None])[0]))
+
+        # ------------------------------------------------ 敏感内容隔离（Guard）JSON API
+        m = re.fullmatch(r"/api/families/([\w.-]+)/guard/rulesets", p)
+        if method == "GET" and m:
+            return self._json(guard.list_rulesets(m.group(1)))
+        if method == "POST" and m:
+            b = _json_body(self)
+            try:
+                res = guard.create_ruleset(
+                    m.group(1), b.get("rules", []), b.get("actor", "api"),
+                    b.get("note", ""), bool(b.get("activate", False)))
+            except ValueError as exc:
+                raise services.DomainError(f"规则非法：{exc}") from exc
+            return self._json(res, 201)
+        m = re.fullmatch(r"/api/guard/rulesets/([\w.-]+)/activate", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            return self._json(guard.activate_ruleset(
+                m.group(1), b.get("actor", "api"),
+                b.get("expected_active_ruleset_id")))
+        m = re.fullmatch(r"/api/guard/rulesets/([\w.-]+)", p)
+        if method == "GET" and m:
+            return self._json(guard.get_ruleset(m.group(1)))
+        m = re.fullmatch(r"/api/families/([\w.-]+)/guard/preview", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            try:
+                return self._json(guard.preview(
+                    m.group(1), b["inputs"], b.get("ruleset_id")))
+            except ValueError as exc:
+                raise services.DomainError(str(exc)) from exc
+        m = re.fullmatch(r"/api/families/([\w.-]+)/guard/grants", p)
+        if m:
+            if method == "GET":
+                return self._json(guard.list_grants(m.group(1)))
+            b = _json_body(self)
+            return self._json(guard.grant_reviewer(
+                m.group(1), b["reviewer"], b.get("actor", "api"),
+                b.get("reason", "")), 201)
+        if method == "GET" and p == "/api/guard/grants":
+            return self._json(guard.list_grants(None))
+        m = re.fullmatch(r"/api/guard/grants/([\w.-]+)/revoke", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            if b.get("expected_version") is None:
+                raise services.DomainError("必须提供 expected_version 做并发控制")
+            return self._json(guard.revoke_reviewer(
+                m.group(1), int(b["expected_version"]), b.get("actor", "api"),
+                b.get("reason", "")))
+        m = re.fullmatch(r"/api/requests/([\w.-]+)/guard", p)
+        if method == "GET" and m:
+            return self._json(guard.request_guard_view(m.group(1)))
+        m = re.fullmatch(r"/api/requests/([\w.-]+)/reveal-credential", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            return self._json(guard.issue_credential(
+                m.group(1), b["reviewer"], b.get("actor", "api"),
+                int(b["ttl_seconds"]) if b.get("ttl_seconds") else None), 201)
+        m = re.fullmatch(r"/api/requests/([\w.-]+)/reveal", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            if not b.get("token"):
+                raise guard.GuardUnauthorized("缺少还原令牌")
+            return self._json(guard.reveal(
+                m.group(1), b["token"], b.get("actor", "api")), 200)
+        if method == "GET" and p == "/api/guard/blocks":
+            return self._json(guard.list_block_log(q.get("family", [None])[0]))
 
         # ------------------------------------------------ 证据包 JSON API
         return self._route_evidence(method, p, q)
@@ -731,28 +834,49 @@ class Handler(BaseHTTPRequestHandler):
                              "model_id": r["model_id"], "pass_rate": r["pass_rate"],
                              "passed": r["passed"], "total": r["total"],
                              "late": r["late"], "created_at": r["created_at"],
+                             "guard_version": r.get("guard_ruleset_version"),
                              "selected": r["run_id"] == selected_id})
+
+        def _fixture_view(run_id):
+            row = get_conn().execute("SELECT * FROM guard_eval_fixtures WHERE run_id=?",
+                                     (run_id,)).fetchone()
+            if not row:
+                return None
+            by_seq = {x["seq"]: x for x in json.loads(row["cases_json"])}
+            return {"version": row["ruleset_version"], "masked": row["masked_total"],
+                    "blocked": row["blocked_total"], "by_seq": by_seq,
+                    "configured": row["ruleset_id"] is not None}
+
+        def _case_rows(detail, fx):
+            out = []
+            for c in detail["cases"]:
+                g = (fx["by_seq"].get(c["seq"], {}) or {}) if fx else {}
+                out.append({"name": c["name"], "ok": c["ok"], "detail": c["detail"],
+                            "input_digest": _short(c["input_digest"]),
+                            "output_digest": _short(c["output_digest"]),
+                            "rendered_prompt": c["rendered_prompt"], "output": c["output"],
+                            "seq": c["seq"],
+                            "gmasked": g.get("masked", 0), "gblocked": g.get("blocked", 0)})
+            return out
+
         if selected_id:
             detail = services.get_eval_run(selected_id)
-            cases = [{"name": c["name"], "ok": c["ok"], "detail": c["detail"],
-                      "input_digest": _short(c["input_digest"]),
-                      "output_digest": _short(c["output_digest"]),
-                      "rendered_prompt": c["rendered_prompt"], "output": c["output"]}
-                     for c in detail["cases"]]
+            fixture = _fixture_view(selected_id)
+            cases = _case_rows(detail, fixture)
             cur_run = detail
         elif runs:
-            detail = services.get_eval_run(runs[0]["run_id"])
-            cases = [{"name": c["name"], "ok": c["ok"], "detail": c["detail"],
-                      "input_digest": _short(c["input_digest"]),
-                      "output_digest": _short(c["output_digest"]),
-                      "rendered_prompt": c["rendered_prompt"], "output": c["output"]}
-                     for c in detail["cases"]]
+            rid0 = runs[0]["run_id"]
+            detail = services.get_eval_run(rid0)
+            fixture = _fixture_view(rid0)
+            cases = _case_rows(detail, fixture)
             cur_run = detail
         else:
             cur_run = None
+            fixture = None
         approvals = services.list_approvals(vid)
         vc = _ver_context(v)
         ctx = {"v": vc, "family": family, "runs": run_rows, "cases": cases,
+               "fixture": fixture,
                "cur_run": cur_run, "approvals": approvals,
                "threshold": config.PASS_THRESHOLD, "flash": self._flash(q)}
         self._html(page(f"评估 · {v['semver']}", "eval.html", ctx))
@@ -890,6 +1014,122 @@ class Handler(BaseHTTPRequestHandler):
                "flash": self._flash(q)}
         self._html(page(f"自动止损 · {ro_view['candidate_semver']}", "stoploss.html", ctx))
 
+    # ============================================================ 敏感隔离页面
+    def _guard_card(self, rid) -> dict:
+        """调用复查页隔离卡片：固定规则版本、遮盖映射、密文数、凭据/还原审计。"""
+        gv = guard.request_guard_view(rid)
+        if not gv:
+            return {"exists": False}
+        creds = []
+        for cd in gv.get("credentials", []):
+            creds.append({"credential_id": cd["credential_id"], "reviewer": cd["reviewer"],
+                          "status": cd["status"], "ttl_seconds": cd["ttl_seconds"],
+                          "issued_at": cd["issued_at"], "expires_at": cd["expires_at"],
+                          "consumed_at": cd["consumed_at"] or ""})
+        reveals = [{"reviewer": r["reviewer"] or "（未识别）", "result": r["result"],
+                    "created_at": r["created_at"], "detail": r["detail"]}
+                   for r in gv.get("reveals", [])]
+        return {
+            "exists": True, "ruleset_id": gv["ruleset_id"],
+            "ruleset_version": gv["ruleset_version"],
+            "ruleset_hash": gv["ruleset_hash"], "short_hash": _short(gv["ruleset_hash"]),
+            "status": gv["status"], "raw_input_digest": gv["raw_input_digest"],
+            "secret_count": gv["secret_count"],
+            "tokens": [{"token": t["token"], "rule_id": t["rule_id"],
+                        "field": t["field"], "path": t["path"]}
+                       for t in gv.get("tokens", [])],
+            "masked": gv["actions"].get("masked", 0),
+            "output_masked": sum(a.get("masked", 0)
+                                 for a in gv.get("output_actions", [])),
+            "credentials": creds, "reveals": reveals,
+            "has_tokens": bool(gv.get("tokens")),
+        }
+
+    def _page_family_guard(self, fid, q):
+        self._is_page = True
+        family = services.get_family(fid)
+        rulesets = guard.list_rulesets(fid)
+        active_id = family.get("active_guard_ruleset_id")
+        rs_rows = []
+        for r in rulesets:
+            rules = []
+            for ru in r["rules"]:
+                rules.append({"id": ru["id"], "kind": ru["kind"], "action": ru["action"],
+                              "name": ru["name"], "pattern": ru["pattern"],
+                              "fields": ", ".join(ru["fields"]),
+                              "token": ru["token"], "is_block": ru["action"] == "block",
+                              "is_mask": ru["action"] == "mask"})
+            rs_rows.append({"ruleset_id": r["ruleset_id"], "version": r["version"],
+                            "status": r["status"], "note": r["note"],
+                            "is_active": r["ruleset_id"] == active_id,
+                            "short_hash": _short(r["content_hash"]),
+                            "rule_count": len(rules), "rules": rules,
+                            "created_by": r["created_by"], "created_at": r["created_at"],
+                            "activated_at": r["activated_at"] or "",
+                            "can_activate": r["status"] == "draft"})
+        active = next((r for r in rs_rows if r["is_active"]), None)
+        grants = []
+        for g in guard.list_grants(fid):
+            grants.append({"grant_id": g["grant_id"], "reviewer": g["reviewer"],
+                           "granted_by": g["granted_by"], "reason": g["reason"],
+                           "revoke_version": g["revoke_version"],
+                           "revoked": bool(g["revoked_at"]),
+                           "revoked_at": g["revoked_at"] or "",
+                           "revoked_by": g["revoked_by"]})
+        # 预览结果（?preview=1 时由表单提交后重定向带结果较复杂；这里用同页 POST 渲染）
+        preview = None
+        if q.get("preview_result"):
+            try:
+                preview = json.loads(q["preview_result"][0])
+            except Exception:  # noqa: BLE001
+                preview = None
+        blocked = [{"request_id": b["request_id"], "rule_id": b["rule_id"],
+                    "version": b["ruleset_version"], "kind": b["kind"],
+                    "fields": ", ".join(json.loads(b["fields_json"])),
+                    "created_at": b["created_at"]}
+                   for b in guard.list_block_log(fid, limit=10)]
+        default_rules = json.dumps([
+            {"id": "phone", "kind": "regex", "action": "mask",
+             "pattern": r"1[3-9]\d{9}", "fields": ["*"], "token": "PHONE",
+             "name": "手机号"},
+            {"id": "forbid_leak", "kind": "keyword", "action": "block",
+             "pattern": "内部机密", "fields": ["*"], "token": "",
+             "name": "禁止泄露词"},
+        ], ensure_ascii=False, indent=2)
+        ctx = {"family": family, "rulesets": rs_rows, "active": active,
+               "grants": grants, "preview": preview, "blocked": blocked,
+               "default_rules": default_rules,
+               "has_active": bool(active), "flash": self._flash(q)}
+        self._html(page(f"敏感内容隔离 · {family['name']}", "guard.html", ctx))
+
+    def _page_guard_audit(self, q):
+        self._is_page = True
+        conn = get_conn()
+        # 逐请求隔离审计流：规则版本变更、阻断、签发/还原/失败（全部不含原值）
+        rows = conn.execute(
+            "SELECT * FROM audit_log WHERE action LIKE 'guard.%' "
+            "OR action='invoke' ORDER BY id DESC LIMIT 200").fetchall()
+        items = []
+        for a in rows:
+            if a["action"].startswith("guard.") or "guard=" in a["detail"] \
+                    or "guard" in a["detail"]:
+                items.append({"id": a["id"], "actor": a["actor"], "action": a["action"],
+                              "entity": a["entity"], "entity_id": a["entity_id"],
+                              "detail": a["detail"], "created_at": a["created_at"],
+                              "is_guard": a["action"].startswith("guard.")})
+        # 凭据/还原尝试明细（只含结论，不含令牌/原值）
+        reveals = [dict(r) for r in conn.execute(
+            "SELECT g.id,g.request_id,g.credential_id,g.reviewer,g.result,g.detail,"
+            "g.created_at FROM guard_reveals g ORDER BY g.id DESC LIMIT 100").fetchall()]
+        blocks = [{"request_id": b["request_id"], "family_id": b["family_id"],
+                   "rule_id": b["rule_id"], "version": b["ruleset_version"],
+                   "fields": ", ".join(json.loads(b["fields_json"])),
+                   "created_at": b["created_at"]}
+                  for b in guard.list_block_log(None, limit=50)]
+        ctx = {"items": items[:120], "reveals": reveals, "blocks": blocks,
+               "flash": self._flash(q)}
+        self._html(page("敏感隔离 · 逐请求审计", "guard_audit.html", ctx))
+
     def _page_replay(self, rid, q):
         self._is_page = True
         req = services.get_request(rid)
@@ -910,6 +1150,7 @@ class Handler(BaseHTTPRequestHandler):
                 rollout = None
         receipt = services.get_request_receipt(rid)
         authz = services.request_authz_view(rid)
+        guard_card = self._guard_card(rid)
         is_candidate_hit = bool(
             rollout and req["version_id"] == rollout["candidate_version_id"])
         same_generation = bool(
@@ -953,6 +1194,7 @@ class Handler(BaseHTTPRequestHandler):
                "rollout": rollout,
                "feedback": feedback_card,
                "authz": _authz_card(authz),
+               "guardcard": guard_card,
                "versions": versions, "models": llm.list_models(),
                "replays": rpl_rows, "result": None, "flash": self._flash(q)}
         # 若带 ?rpl= 则展示该报告详情
@@ -1067,12 +1309,28 @@ class Handler(BaseHTTPRequestHandler):
                   "input_digest": c["input_digest"], "output_digest": c["output_digest"],
                   "rendered_prompt": c["rendered_prompt"], "output": c["output"]}
                  for c in (cur["cases"] if cur else [])]
+        fixture = view.guard_fixture(selected_id) if selected_id else None
+        if fixture:
+            by_seq = {x["seq"]: x for x in fixture["cases"]}
+            for c in cases:
+                fx = by_seq.get(c["seq"])
+                c["masked"] = fx["masked"] if fx else 0
+                c["blocked"] = fx["blocked"] if fx else 0
+                c["output_masked"] = fx["output_masked"] if fx else 0
         run_rows = [{"run_id": r["run_id"], "status": r["status"], "model_id": r["model_id"],
                      "pass_rate": r["pass_rate"], "passed": r["passed"], "total": r["total"],
                      "late": r["late"], "created_at": r["created_at"],
+                     "guard_version": r.get("guard_ruleset_version"),
                      "selected": r["run_id"] == selected_id} for r in runs]
         ctx = {"pid": pid, "v": vc, "family": family, "runs": run_rows,
                "cur_run": cur, "cases": cases, "threshold": config.PASS_THRESHOLD,
+               "fixture": ({"version": fixture["ruleset_version"],
+                            "masked": fixture["masked_total"],
+                            "blocked": fixture["blocked_total"],
+                            "ruleset_in_pack": bool(
+                                view.guard_ruleset(fixture["ruleset_id"]))
+                            if fixture["ruleset_id"] else False}
+                           if fixture else None),
                "approvals": [services.approval_view(a) for a in view.approvals(vid)],
                "flash": self._flash(q)}
         self._html(page(f"包内评估 · {vc['semver']}", "pack_eval.html", ctx))
@@ -1112,6 +1370,27 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 authz_pack = {"required": False}
         semvers = {x["version_id"]: x["semver"] for x in view.by_table["versions"]}
+        # 包内敏感隔离视图（只读；密文/凭据不入包，故无还原入口）
+        gmask = view.guard_mask(rid)
+        guard_pack = None
+        if gmask:
+            grs = view.guard_ruleset(gmask["ruleset_id"])
+            guard_pack = {
+                "exists": True, "status": req.get("guard_status", ""),
+                "ruleset_version": gmask["ruleset_version"],
+                "ruleset_id": gmask["ruleset_id"],
+                "ruleset_in_pack": bool(grs),
+                "short_hash": _short(gmask["ruleset_hash"]),
+                "raw_input_digest": gmask["raw_input_digest"],
+                "masked": gmask["actions"].get("masked", 0),
+                "output_masked": sum(a.get("masked", 0)
+                                     for a in gmask.get("output_actions", [])),
+                "tokens": [{"token": t["token"], "rule_id": t["rule_id"],
+                            "field": t["field"], "path": t["path"]}
+                           for t in gmask["tokens"]],
+                "has_tokens": bool(gmask["tokens"]),
+                "rules": grs["rules"] if grs else [],
+                "hash_ok": bool(grs and grs["content_hash"] == gmask["ruleset_hash"])}
         rpl_rows = [{"replay_id": r["replay_id"], "mode": r["mode"], "verdict": r["verdict"],
                      "changed_axis": r["changed_axis"], "same_template": r["same_template"],
                      "same_model": r["same_model"], "same_input": r["same_input"],
@@ -1139,6 +1418,7 @@ class Handler(BaseHTTPRequestHandler):
                     "created_at": req["created_at"]},
             "has_receipt": bool(receipt), "receipt": receipt,
             "authz": authz_pack,
+            "guardpack": guard_pack,
             "replays": rpl_rows, "flash": self._flash(q)}
         self._html(page("包内调用复查", "pack_replay.html", ctx))
 
@@ -1363,6 +1643,94 @@ class Handler(BaseHTTPRequestHandler):
         f = _form(self)
         evidence.abort_import(import_id, f.get("actor", "web") or "web")
         self._redirect("/evidence")
+
+    # ============================================================ Guard UI 动作
+    def _ui_guard_create_ruleset(self, fid):
+        self._is_page = True
+        f = _form(self)
+        try:
+            rules = json.loads(f.get("rules", "[]"))
+            rs = guard.create_ruleset(
+                fid, rules, f.get("actor", "web") or "web", f.get("note", ""),
+                activate=(f.get("activate") == "1"))
+        except ValueError as exc:
+            self._redirect(f"/families/{fid}/guard?err=" + quote(f"规则非法：{exc}"))
+            return
+        self._redirect(f"/families/{fid}/guard")
+
+    def _ui_guard_activate(self, ruleset_id):
+        self._is_page = True
+        f = _form(self)
+        expected = f.get("expected_active_ruleset_id") or None
+        rs = guard.activate_ruleset(ruleset_id, f.get("actor", "web") or "web", expected)
+        self._redirect(f"/families/{rs['family_id']}/guard")
+
+    def _ui_guard_preview(self, fid):
+        self._is_page = True
+        f = _form(self)
+        inputs = _jloads_field(f, "inputs_json", {})
+        rules = f.get("rules", "").strip()
+        try:
+            if rules:
+                # 用表单里尚未保存的规则做预览：创建为草稿（不生效）再预览
+                rs = guard.create_ruleset(
+                    fid, json.loads(rules), f.get("actor", "web") or "web",
+                    "隔离预览草稿", activate=False)
+                pv = guard.preview(fid, inputs, rs["ruleset_id"])
+            else:
+                pv = guard.preview(fid, inputs, None)
+        except (ValueError, guard.GuardError) as exc:
+            self._redirect(f"/families/{fid}/guard?err=" + quote(str(exc)[:200]))
+            return
+        payload = json.dumps(pv, ensure_ascii=False)
+        self._redirect(f"/families/{fid}/guard?preview_result=" + quote(payload))
+
+    def _ui_guard_grant(self, fid):
+        self._is_page = True
+        f = _form(self)
+        guard.grant_reviewer(fid, f["reviewer"].strip(), f.get("actor", "web") or "web",
+                             f.get("reason", ""))
+        self._redirect(f"/families/{fid}/guard")
+
+    def _ui_guard_revoke_grant(self, grant_id):
+        self._is_page = True
+        f = _form(self)
+        g = guard.revoke_reviewer(grant_id, int(f["expected_version"]),
+                                  f.get("actor", "web") or "web", f.get("reason", ""))
+        self._redirect(f"/families/{g['family_id']}/guard")
+
+    def _ui_guard_issue(self, rid):
+        self._is_page = True
+        f = _form(self)
+        try:
+            res = guard.issue_credential(
+                rid, f["reviewer"].strip(), f.get("actor", "web") or "web",
+                int(f["ttl_seconds"]) if f.get("ttl_seconds", "").strip() else None)
+        except (guard.GuardError, ValueError) as exc:
+            self._redirect(f"/requests/{rid}/replay?err=" + quote(str(exc)[:200]))
+            return
+        # 明文令牌仅此一次展示；落到一次性提示页
+        ctx = {"rid": rid, "token": res["token"], "credential_id": res["credential_id"],
+               "reviewer": res["reviewer"], "expires_at": res["expires_at"],
+               "ttl": res["ttl_seconds"]}
+        self._html(page("还原凭据（仅此一次显示）", "guard_credential.html", ctx))
+
+    def _ui_guard_reveal(self, rid):
+        self._is_page = True
+        f = _form(self)
+        try:
+            res = guard.reveal(rid, f.get("token", ""), f.get("actor", "web") or "web")
+        except (guard.GuardError, ValueError) as exc:
+            self._redirect(f"/requests/{rid}/replay?err=" + quote(str(exc)[:200]))
+            return
+        values = [{"token": v["token"], "rule_id": v["rule_id"], "field": v["field"],
+                   "path": v["path"], "value": v["value"]} for v in res["values"]]
+        ctx = {"rid": rid, "reviewer": res["reviewer"],
+               "credential_id": res["credential_id"], "consumed_at": res["consumed_at"],
+               "values": values,
+               "raw_inputs": json.dumps(res["raw_inputs"], ensure_ascii=False, indent=2)}
+        self._html(page("原值还原结果（凭据已消费）", "guard_reveal.html", ctx))
+
 
 
 def _bump(semver: str) -> str:

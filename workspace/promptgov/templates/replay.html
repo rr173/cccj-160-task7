@@ -89,6 +89,83 @@
 </div>
 {% endif %}
 
+{% if guardcard.exists %}
+<div class="card">
+  <h2>敏感内容隔离（命中时固定规则版本与遮盖映射）</h2>
+  <div class="kv">
+    <div>隔离状态</div><div>
+      {% if guardcard.status == 'masked' %}<span class="badge b-evaluating">masked 发生遮盖</span>
+      {% elif guardcard.status == 'clean' %}<span class="badge b-active">clean 已扫描无命中</span>
+      {% else %}<span class="chip">{{ guardcard.status }}</span>{% endif %}</div>
+    <div>固定规则版本</div><div>v{{ guardcard.ruleset_version }}
+      <span class="mono small">{{ guardcard.ruleset_id }}</span>
+      <span class="chip">{{ guardcard.short_hash }}</span>
+      <div class="small mut">规则更新不改变本请求；评估回放与证据包复核共用此版本</div></div>
+    <div>原始输入摘要</div><div class="mono small">{{ guardcard.raw_input_digest }}</div>
+    <div>遮盖占位</div><div>{{ guardcard.masked }} 个 · 输出侧再遮盖 {{ guardcard.output_masked }} 处 ·
+      密文保管 {{ guardcard.secret_count }} 条（库内仅此表含密文）</div>
+  </div>
+  {% if guardcard.has_tokens %}
+  <h3>遮盖映射（无原值）</h3>
+  <table>
+    <thead><tr><th>占位符（已参与渲染）</th><th>规则</th><th>字段</th><th>路径</th></tr></thead>
+    <tbody>
+    {% for t in guardcard.tokens %}
+      <tr><td class="mono small">{{ t.token }}</td>
+        <td class="small">{{ t.rule_id }}</td>
+        <td class="small">{{ t.field }}</td>
+        <td class="small">{{ t.path }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <div class="note" style="margin-top:12px">
+    原值只加密存于 guard_secrets；下方展示的“原始输入/渲染提示/输出”均为遮盖后内容。
+    只有<b>获本模板族授权</b>的复核人可签发短期、单次、绑定本请求的凭据还原；
+    导出证据包不含密文，包内复核无法还原。
+  </div>
+  <h3>申请短期还原凭据</h3>
+  <form method="post" action="/ui/requests/{{ req.request_id }}/reveal-credential"
+        class="grid g3" style="grid-template-columns:1fr 120px auto">
+    <input name="reviewer" placeholder="复核人标识（须已获该模板族授权）" required>
+    <input name="ttl_seconds" placeholder="有效期秒" value="300">
+    <button>签发凭据</button>
+  </form>
+  {% if guardcard.credentials %}
+  <h3>凭据记录（库中只存令牌哈希）</h3>
+  <table>
+    <thead><tr><th>复核人</th><th>状态</th><th>有效期</th><th>签发</th><th>过期</th><th>消费</th></tr></thead>
+    <tbody>
+    {% for c in guardcard.credentials %}
+      <tr><td class="small">{{ c.reviewer }}</td>
+        <td>{% if c.status == 'consumed' %}<span class="badge b-superseded">consumed 已消费</span>
+          {% elif c.status == 'revoked' %}<span class="badge b-revoked">revoked 授权撤销</span>
+          {% else %}<span class="badge b-approved">{{ c.status }}</span>{% endif %}</td>
+        <td class="small">{{ c.ttl_seconds }}s</td>
+        <td class="small">{{ c.issued_at }}</td>
+        <td class="small">{{ c.expires_at }}</td>
+        <td class="small">{{ c.consumed_at }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  {% if guardcard.reveals %}
+  <h3>还原尝试审计（含未授权/过期/重复，绝不含原值）</h3>
+  <table>
+    <thead><tr><th>时间</th><th>复核人</th><th>结论</th><th>明细</th></tr></thead>
+    <tbody>
+    {% for r in guardcard.reveals %}
+      <tr><td class="small">{{ r.created_at }}</td>
+        <td class="small">{{ r.reviewer }}</td>
+        <td class="small">{{ r.result }}</td>
+        <td class="small mut">{{ r.detail }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  {% endif %}
+</div>
+{% endif %}
+
 {% if result %}
 <div class="card">
   <h2>重演报告</h2>

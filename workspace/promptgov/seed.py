@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from . import services
+from . import guard, services
 from .db import get_conn
 
 FAMILY = "support-router"
@@ -133,7 +133,30 @@ def run() -> None:
         services.report_feedback(ro["rollout_id"], f"seed-demo-fb-{idx:02d}",
                                  res["request_id"], outcome, actor)
 
+    # 敏感内容隔离演示：v1 规则版本——手机号/邮箱替换、“内部机密”关键词阻断；
+    # 授权一名复核人可签发短期还原凭据。随后再造一条含手机号的线上请求，
+    # 请求复查页可看到固定规则版本、遮盖映射与还原入口。
+    guard_rules_v1 = [
+        {"id": "phone", "kind": "regex", "action": "mask",
+         "pattern": r"1[3-9]\d{9}", "fields": ["*"], "token": "PHONE",
+         "name": "手机号"},
+        {"id": "email", "kind": "regex", "action": "mask",
+         "pattern": r"[\w.+-]+@[\w-]+\.[\w.-]+", "fields": ["*"], "token": "EMAIL",
+         "name": "邮箱"},
+        {"id": "internal_secret", "kind": "keyword", "action": "block",
+         "pattern": "内部机密", "fields": ["*"], "token": "",
+         "name": "禁止外泄内部机密"},
+    ]
+    guard.create_ruleset(FAMILY, guard_rules_v1, actor,
+                         "v1：手机号/邮箱替换，内部机密阻断", activate=True)
+    guard.grant_reviewer(FAMILY, "auditor-li", actor, "客服质检复核人，可短期还原")
+    services.invoke(FAMILY,
+                    {"customer_text": "回电请打 13812345678，或发邮件 a.b@example.com",
+                     "lang": "zh", "channel": "app"}, actor,
+                    request_id="seed-guard-masked-01")
+
     conn.commit()
     print("[seed] 演示数据就绪：family=%s 线上=v1，候选 v2（20%% 放量中，止损 3600s/"
           "n≥10/失败≤30%%，已入账 8 成功 2 失败）、v3（需工具权限审批）、"
-          "v4（弱模型证据）" % FAMILY)
+          "v4（弱模型证据）；敏感隔离 v1（手机/邮箱替换、机密阻断，"
+          "复核人 auditor-li）" % FAMILY)

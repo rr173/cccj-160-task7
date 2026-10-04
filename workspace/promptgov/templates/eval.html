@@ -122,14 +122,25 @@
 
 {% if cases %}
 <div class="card" style="margin-top:16px">
-  <h2>逐用例证据明细 {% if cur_run %}<span class="small mono">（{{ cur_run.run_id }}，模型 {{ cur_run.model_id }}）</span>{% endif %}</h2>
+  <h2>逐用例证据明细 {% if cur_run %}<span class="small mono">（{{ cur_run.run_id }}，模型 {{ cur_run.model_id }}）</span>{% endif %}
+    {% if fixture %}<span class="chip">敏感隔离规则版本 v{{ fixture.version }} ·
+      遮盖 {{ fixture.masked }} 处 · 阻断 {{ fixture.blocked }} 用例</span>{% endif %}
+  </h2>
+  {% if fixture %}
+  <p class="small">评估在开始时<b>固定</b>了族上的隔离规则版本 v{{ fixture.version }}：
+    被替换内容参与渲染与推理，阻断用例不调用模型（证据中渲染提示/输出无原值）。
+    之后规则更新不改变本次评估；证据包复核共用此版本。</p>
+  {% endif %}
   <table>
-    <thead><tr><th>#</th><th>用例</th><th>结果</th><th>判定说明</th><th>输入摘要</th><th>输出摘要</th></tr></thead>
+    <thead><tr><th>#</th><th>用例</th><th>结果</th><th>隔离</th><th>判定说明</th><th>输入摘要</th><th>输出摘要</th></tr></thead>
     <tbody>
     {% for c in cases %}
       <tr>
         <td>{{ c.seq }}</td><td>{{ c.name }}</td>
         <td>{% if c.ok %}<span class="ok">PASS</span>{% else %}<span class="bad">FAIL</span>{% endif %}</td>
+        <td class="small">{% if c.gblocked %}<span class="badge b-rejected">阻断</span>
+          {% elif c.gmasked %}<span class="badge b-evaluating">遮盖 {{ c.gmasked }}</span>
+          {% else %}<span class="mut">—</span>{% endif %}</td>
         <td class="small">{{ c.detail }}</td>
         <td class="small mono">{{ c.input_digest }}</td>
         <td class="small mono">{{ c.output_digest }}</td>

@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from . import config, core, llm
+from . import config, core, guard, llm
 from .db import audit, get_conn, write_tx
 
 
@@ -276,14 +276,29 @@ def start_evaluation(version_id: str, actor: str) -> str:
         (testset["testset_id"],)).fetchall()
 
     with write_tx() as c:
+        # 评估回放与线上请求共用同一规则来源：评估开始瞬间族上生效的隔离规则
+        # 版本被固定到 eval_run；评估进行期间规则更新不改变本次评估，历史证据
+        # 永远按本版本复核（与请求固定 ruleset 同理）。
+        grs_row = None
+        fam = c.execute("SELECT active_guard_ruleset_id FROM families WHERE family_id=?",
+                        (v["family_id"],)).fetchone()
+        if fam["active_guard_ruleset_id"]:
+            grs_row = c.execute("SELECT * FROM guard_rulesets WHERE ruleset_id=?",
+                                (fam["active_guard_ruleset_id"],)).fetchone()
         c.execute(
-            """INSERT INTO eval_runs(run_id,version_id,testset_id,model_id,status,total)
-               VALUES (?,?,?,?, 'running', ?)""",
-            (run_id, version_id, testset["testset_id"], use_model, len(cases)))
+            """INSERT INTO eval_runs(run_id,version_id,testset_id,model_id,status,total,
+               guard_ruleset_id,guard_ruleset_version,guard_ruleset_hash)
+               VALUES (?,?,?,?, 'running', ?,?,?,?)""",
+            (run_id, version_id, testset["testset_id"], use_model, len(cases),
+             grs_row["ruleset_id"] if grs_row else None,
+             grs_row["version"] if grs_row else None,
+             grs_row["content_hash"] if grs_row else ""))
         c.execute("UPDATE versions SET status='evaluating' WHERE version_id=? "
                   "AND status IN ('draft','failed_eval','evaluated')", (version_id,))
         audit(actor, "eval.start", "eval_run", run_id,
-              f"version={version_id} model={use_model} cases={len(cases)}")
+              f"version={version_id} model={use_model} cases={len(cases)}"
+              + (f" guard={grs_row['ruleset_id']}@v{grs_row['version']}"
+                 if grs_row else " guard=none"))
     return run_id
 
 
@@ -303,19 +318,62 @@ def run_evaluation(run_id: str, actor: str = "evaluator") -> dict:
     contract = _loads(v["variable_contract"])
     params = _loads(v["model_params"])
 
+    # 评估固定的隔离规则版本（start 时固化）：无则不隔离
+    eval_rules = None
+    if run["guard_ruleset_id"]:
+        grs_row = get_conn().execute("SELECT * FROM guard_rulesets WHERE ruleset_id=?",
+                                     (run["guard_ruleset_id"],)).fetchone()
+        eval_rules = _loads(grs_row["rules_json"]) if grs_row else None
+
     cases = get_conn().execute(
         "SELECT * FROM testcases WHERE testset_id=? ORDER BY seq",
         (run["testset_id"],)).fetchall()
     passed = 0
     detail_rows = []
+    guard_case_stats = []
+    g_masked_total = g_blocked_total = 0
     for case in cases:
         raw_inputs = _loads(case["inputs"])
         inputs = core.project_inputs(raw_inputs, contract)
         inp_digest = core.digest_inputs(inputs)
-        prompt = core.render_prompt(v["system_instruction"], contract, raw_inputs)
+        c_masked = c_blocked = c_outmasked = 0
+        if eval_rules:
+            scan = guard.scan_inputs(eval_rules, inputs)
+            if scan["blocked"]:
+                # 阻断用例：不渲染原指令、不调用模型，记录确定性的阻断提示作为
+                # 渲染提示与输出（无原值），断言必不通过，证据可复现。
+                c_blocked = scan["blocked"].get("match_count", 1)
+                g_blocked_total += 1
+                guard_case_stats.append({"seq": case["seq"], "name": case["name"],
+                                         "masked": 0, "blocked": c_blocked,
+                                         "output_masked": 0,
+                                         "rule_id": scan["blocked"]["rule_id"]})
+                block_prompt = (
+                    f"[GUARD BLOCKED] 用例输入在评估固定规则版本 "
+                    f"v{run['guard_ruleset_version']} 命中阻断规则 "
+                    f"{scan['blocked']['rule_id']}（字段 "
+                    f"{scan['blocked']['fields']}），请求被拒绝，未进行模板渲染与推理。")
+                block_output = json.dumps(
+                    {"blocked": True, "rule_id": scan["blocked"]["rule_id"],
+                     "ruleset_version": run["guard_ruleset_version"]},
+                    ensure_ascii=False, sort_keys=True)
+                detail_rows.append((case["case_id"], case["seq"], case["name"], inp_digest,
+                                    block_prompt, block_output,
+                                    core.digest_output(block_output), 0,
+                                    "敏感内容阻断，未进入推理"))
+                continue
+            inputs = scan["masked_inputs"]
+            c_masked = len(scan["tokens"])
+            g_masked_total += c_masked
+        prompt = core.render_prompt(v["system_instruction"], contract, inputs)
         output = llm.generate(run["model_id"], v["content_hash"], prompt, inputs, params)
+        if eval_rules:
+            output, c_outmasked = guard.scan_output(eval_rules, output)
         ok, detail = llm.assert_expect(output, _loads(case["expect"]))
         passed += int(ok)
+        guard_case_stats.append({"seq": case["seq"], "name": case["name"],
+                                 "masked": c_masked, "blocked": 0,
+                                 "output_masked": c_outmasked})
         detail_rows.append((case["case_id"], case["seq"], case["name"], inp_digest,
                             prompt, output, core.digest_output(output), int(ok), detail))
     total = len(cases)
@@ -347,8 +405,21 @@ def run_evaluation(run_id: str, actor: str = "evaluator") -> dict:
         elif cur == "approved":
             c.execute("UPDATE versions SET pass_rate=? WHERE version_id=?",
                       (rate, v["version_id"]))
+        # 隔离回放记录：逐用例遮盖/阻断统计（不含原值）；即使族上未配置规则也
+        # 写一行（ruleset_id 为 NULL），表示"本次评估在无隔离下进行"这一确定事实。
+        c.execute(
+            """INSERT INTO guard_eval_fixtures(run_id,ruleset_id,ruleset_version,
+               ruleset_hash,cases_json,masked_total,blocked_total)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(run_id) DO NOTHING""",
+            (run_id, run["guard_ruleset_id"], run["guard_ruleset_version"],
+             run["guard_ruleset_hash"] or "",
+             json.dumps(guard_case_stats, ensure_ascii=False),
+             g_masked_total, g_blocked_total))
         audit(actor, "eval.finish", "eval_run", run_id,
-              f"{status} {passed}/{total} rate={rate:.2f} late={int(late)}")
+              f"{status} {passed}/{total} rate={rate:.2f} late={int(late)}"
+              + (f" guard_masked={g_masked_total} guard_blocked={g_blocked_total}"
+                 if run["guard_ruleset_id"] else ""))
     return get_eval_run(run_id)
 
 
@@ -1429,27 +1500,42 @@ def stoploss_overview(rollout_id: str) -> dict:
 
 def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = None,
            routing_key: str | None = None) -> dict:
-    """线上推理：路由决策 + 精确三元组固化。
+    """线上推理：敏感隔离 → 路由决策 → 精确三元组固化。
 
-    - 无进行中批次：只消费当前线上版本（原有一步切换语义不变）；
-    - 批次放量中且携带 routing_key：稳定散列分桶，bucket < weight 走候选构件，
-      否则走当前构件；同一代次内同一 key 的决定不漂移；
-    - 批次冻结中 / 未携带 routing_key：一律走当前构件；
-    - 命中候选且候选相对线上新增可调用工具时，按**业务请求发生时刻**当场复核
-      专项授权（写锁事务内 at=db_now）：尚未生效 / 恰好到期 / 已撤销 /
-      只覆盖部分工具都拒绝（事务回滚，已生效路由表不变）；复核依据（授权
-      快照）固化到 requests.authz_snapshot_json，此后复查只按该快照，不随
-      之后到期或撤销改写结论。
+    处理顺序（隔离不可绕过）：
+    1. 写锁事务内解析路由（命中构件/批次/授权快照），并读取族上**当前**隔离
+       规则版本指针；同时用客户端 request_id 做幂等检查。
+    2. 契约校验/投影后，对**原始**输入按固定规则版本扫描：block 命中即拒绝
+       （不渲染、不推理，写 guard_block_log 后抛 GuardBlocked）；mask 命中则
+       替换，遮盖后的输入参与模板渲染与模型推理；输出再扫一次防回显。
+    3. 落库事务内再次确认扩权授权，并把规则版本 id/version/hash、原始输入摘要、
+       遮盖映射（无原值）与密文（guard_secrets）固化。
+
+    规则更新（新版本+翻族指针）发生在本请求解析之后时，本请求仍使用已固定的
+    ruleset——规则更新不能改写在途请求。同一 request_id 的重复请求返回同一
+    遮盖结果（不重新推理、不暴露原值）。
     """
     routing_key = (routing_key or "").strip() or None
+    rid = (request_id or "").strip() or _uid("req")
+
+    # --- 事务 1（立即取锁）：路由解析 + 规则版本固定 + 幂等检查 ---
     authz_snapshot = {"required": False}
-    with write_tx() as c:  # 立即取锁，保证读到的指针/批次与版本快照一致
+    with write_tx() as c:
         family = c.execute("SELECT * FROM families WHERE family_id=?", (family_id,)).fetchone()
         if not family:
             raise NotFound(f"模板族不存在: {family_id}")
         active_id = family["active_version_id"]
         if not active_id:
             raise Conflict("该模板族尚未发布任何版本，拒绝线上流量")
+
+        # 幂等：同一 request_id 视为同一业务请求。重复推理必须返回同一遮盖结果；
+        # 原始输入摘要不同则明确拒绝（同一业务标识不允许改换内容重放）。
+        prior = c.execute("SELECT * FROM requests WHERE request_id=?", (rid,)).fetchone()
+        prior_block = None
+        if not prior:
+            prior_block = c.execute(
+                "SELECT * FROM guard_block_log WHERE request_id=? ORDER BY id DESC LIMIT 1",
+                (rid,)).fetchone()
 
         hit_version_id = active_id
         hit_rollout_id = None
@@ -1466,7 +1552,6 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
                                  (active_id,)).fetchone()
                 base_tools, cand_tools = (_loads(base["tool_permissions"]),
                                           _loads(cand["tool_permissions"]))
-                # 按业务请求发生时刻重新确认授权仍有效，且覆盖候选新增的全部工具。
                 at = db_now(c)
                 gate = _require_active_expansion(
                     c, cand["version_id"], base_tools, cand_tools, at,
@@ -1490,9 +1575,6 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
                 hit_rollout_id = rollout["rollout_id"]
                 hit_generation = rollout["generation"]
         elif rollout and rollout["status"] == "frozen":
-            # 冻结（含自动止损冻结）期间，调用一律命中基线构件，但仍固化批次与代次：
-            # 这样该调用的回执能被识别为"属于本试投、冻结期基线请求"（hit_baseline/
-            # stoploss_tripped，仅审计），而不会与完全无关的请求混为一谈。
             hit_rollout_id = rollout["rollout_id"]
             hit_generation = rollout["generation"]
         v = c.execute("SELECT * FROM versions WHERE version_id=?", (hit_version_id,)).fetchone()
@@ -1502,17 +1584,87 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
         if not model_id:
             raise DomainError("命中版本缺少绑定模型标识（数据异常）")
 
+        # 固定本请求所用的敏感隔离规则版本（随后翻指针不影响本请求）
+        grs = None
+        if family["active_guard_ruleset_id"]:
+            grs_row = c.execute("SELECT * FROM guard_rulesets WHERE ruleset_id=?",
+                                (family["active_guard_ruleset_id"],)).fetchone()
+            grs = ({"ruleset_id": grs_row["ruleset_id"], "version": grs_row["version"],
+                    "content_hash": grs_row["content_hash"],
+                    "rules": _loads(grs_row["rules_json"])} if grs_row else None)
+
     errors = core.validate_against_contract(inputs, contract)
     if errors:
         raise DomainError("输入违反变量契约: " + "; ".join(errors))
-    effective = core.project_inputs(inputs, contract)
-    prompt = core.render_prompt(v["system_instruction"], contract, inputs)
+    effective_raw = core.project_inputs(inputs, contract)
+    raw_digest = core.digest_inputs(effective_raw)
+
+    # 幂等归宿 1：重复的成功请求——返回同一（遮盖）结果，绝不重新推理/再暴露原值
+    if prior:
+        if prior["raw_input_digest"] and prior["raw_input_digest"] != raw_digest:
+            raise Conflict(
+                f"request_id={rid} 已存在但输入摘要不同：同一业务请求标识不允许改换"
+                "内容重放；如需新结果请使用新 request_id")
+        return _idempotent_response(prior)
+    # 幂等归宿 2：重复的阻断请求——给出同一确定的拒绝结论（不携带原值）
+    if prior_block:
+        pb = dict(prior_block)
+        audit(actor, "guard.block.duplicate", "request", rid,
+              f"family={family_id} ruleset=v{pb['ruleset_version']} "
+              f"rule={pb['rule_id']} 重复阻断请求，返回同一拒绝结论")
+        raise guard.GuardBlocked(pb["rule_id"], pb["rule_name"], pb["kind"],
+                                 _loads(pb["fields_json"]), pb["ruleset_version"], rid)
+
+    # --- 敏感隔离扫描（规则版本已固定；替换后内容参与渲染）---
+    guard_status = "none"
+    scan = None
+    effective = effective_raw
+    if grs:
+        scan = guard.scan_inputs(grs["rules"], effective_raw)
+        if scan["blocked"]:
+            with write_tx() as c:
+                # 并发的同 request_id 阻断：行可能已被另一线程写入，重读给出同一结论
+                raced = c.execute(
+                    "SELECT * FROM guard_block_log WHERE request_id=? ORDER BY id DESC LIMIT 1",
+                    (rid,)).fetchone()
+                if raced:
+                    rb = dict(raced)
+                    audit(actor, "guard.block.duplicate", "request", rid,
+                          f"family={family_id} ruleset=v{rb['ruleset_version']} "
+                          f"rule={rb['rule_id']} 并发重复阻断")
+                else:
+                    guard.log_block(c, request_id=rid, family_id=family_id, rs=grs,
+                                    blocked=scan["blocked"], raw_input_digest=raw_digest,
+                                    actor=actor)
+                    audit(actor, "guard.block", "request", rid,
+                          f"family={family_id} ruleset={grs['ruleset_id']}@v{grs['version']} "
+                          f"rule={scan['blocked']['rule_id']} "
+                          f"fields={scan['blocked']['fields']} "
+                          f"count={scan['blocked']['match_count']} raw={raw_digest[:12]}")
+            raise guard.GuardBlocked(scan["blocked"]["rule_id"], scan["blocked"]["name"],
+                                     scan["blocked"]["kind"], scan["blocked"]["fields"],
+                                     grs["version"], rid)
+        effective = scan["masked_inputs"]
+        guard_status = "masked" if scan["tokens"] else "clean"
+
+    prompt = core.render_prompt(v["system_instruction"], contract,
+                                effective if grs else inputs)
     output = llm.generate(model_id, v["content_hash"], prompt, effective, params)
+
+    # 输出侧遮盖：模型若回显任一被替换原值，输出中再次命中同一模式即遮盖，
+    # 保证导出/返回/落库的输出不含明文。
+    output_masked_count = 0
+    output_actions: list[dict] = []
+    if grs:
+        masked_output, output_masked_count = guard.scan_output(grs["rules"], output)
+        if output_masked_count:
+            output_actions.append({"stage": "output", "masked": output_masked_count})
+            output = masked_output
+
     inp_digest = core.digest_inputs(effective)
     out_digest = core.digest_output(output)
     params_json = json.dumps(params, sort_keys=True, ensure_ascii=False)
     params_fp = core.params_fingerprint(params)
-    rid = request_id or _uid("req")
 
     with write_tx() as c:
         # 插入前在同一写锁事务内按"请求落库时刻"再确认一次授权（路由决策与本行
@@ -1546,23 +1698,44 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
                 "state_at_check": a["state"],
             }
         snapshot_json = json.dumps(authz_snapshot, ensure_ascii=False, sort_keys=True)
+        grs_id = grs["ruleset_id"] if grs else None
+        grs_ver = grs["version"] if grs else None
+        grs_hash = grs["content_hash"] if grs else ""
         c.execute(
             """INSERT INTO requests(request_id,family_id,version_id,model_id,input_digest,
                inputs_json,rendered_prompt,output_digest,output,template_hash_at_call,
                routing_key,rollout_id,rollout_generation,params_json,params_fingerprint,
-               authz_snapshot_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               authz_snapshot_json,guard_ruleset_id,guard_ruleset_version,
+               guard_ruleset_hash,raw_input_digest,guard_status)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (rid, family_id, hit_version_id, model_id, inp_digest,
              json.dumps(effective, ensure_ascii=False, sort_keys=True), prompt,
              out_digest, output, v["content_hash"], routing_key, hit_rollout_id,
-             hit_generation, params_json, params_fp, snapshot_json))
+             hit_generation, params_json, params_fp, snapshot_json,
+             grs_id, grs_ver, grs_hash, raw_digest, guard_status))
+        if grs and scan and scan["tokens"]:
+            tokens = scan["tokens"]
+            guard.persist_secrets(c, rid, tokens)
+            actions = {"masked": len(tokens),
+                       "rules_hit": scan["rules_hit"],
+                       "rule_ids": sorted({t["rule_id"] for t in tokens})}
+            c.execute(
+                """INSERT INTO guard_request_masks(request_id,ruleset_id,ruleset_version,
+                   ruleset_hash,raw_input_digest,tokens_json,actions_json,
+                   output_actions_json) VALUES (?,?,?,?,?,?,?,?)""",
+                (rid, grs["ruleset_id"], grs["version"], grs["content_hash"], raw_digest,
+                 json.dumps(guard.storable_tokens(tokens), ensure_ascii=False),
+                 json.dumps(actions, ensure_ascii=False, sort_keys=True),
+                 json.dumps(output_actions, ensure_ascii=False)))
         audit(actor, "invoke", "request", rid,
               f"family={family_id} version={hit_version_id} model={model_id} "
               f"input={inp_digest[:12]} output={out_digest[:12]}"
               + (f" rollout={hit_rollout_id}@gen{hit_generation} key={routing_key}"
                  if hit_rollout_id else "")
               + (" authz=" + authz_snapshot.get("approval_id", "none")
-                 if authz_snapshot.get("required") else ""))
+                 if authz_snapshot.get("required") else "")
+              + (f" guard=v{grs['version']} {guard_status} masked="
+                 f"{len(scan['tokens']) if scan else 0}" if grs else ""))
     return {
         "request_id": rid, "family_id": family_id, "version_id": hit_version_id,
         "model_id": model_id, "input_digest": inp_digest, "template_hash": v["content_hash"],
@@ -1570,6 +1743,37 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
         "routing_key": routing_key, "rollout_id": hit_rollout_id,
         "rollout_generation": hit_generation, "params_fingerprint": params_fp,
         "authz_snapshot": authz_snapshot,
+        "guard": {"ruleset_id": grs_id, "ruleset_version": grs_ver,
+                  "ruleset_hash": grs_hash, "status": guard_status,
+                  "masked": len(scan["tokens"]) if grs and scan else 0,
+                  "output_masked": output_masked_count,
+                  "redacted": True if (grs and scan and scan["tokens"]) else False},
+        "idempotent": False,
+    }
+
+
+def _idempotent_response(row) -> dict:
+    """重复请求：从已落库（遮盖后）记录重建同一响应，绝不重新推理或暴露原值。"""
+    d = dict(row)
+    gv = guard.request_guard_view(d["request_id"])
+    return {
+        "request_id": d["request_id"], "family_id": d["family_id"],
+        "version_id": d["version_id"], "model_id": d["model_id"],
+        "input_digest": d["input_digest"], "template_hash": d["template_hash_at_call"],
+        "output_digest": d["output_digest"], "rendered_prompt": d["rendered_prompt"],
+        "output": _loads(d["output"]),
+        "routing_key": d["routing_key"], "rollout_id": d["rollout_id"],
+        "rollout_generation": d["rollout_generation"],
+        "params_fingerprint": d["params_fingerprint"],
+        "authz_snapshot": (_loads(d["authz_snapshot_json"])
+                           if d["authz_snapshot_json"] else {"required": False}),
+        "guard": ({"ruleset_id": gv["ruleset_id"], "ruleset_version": gv["ruleset_version"],
+                   "ruleset_hash": gv["ruleset_hash"], "status": gv["status"],
+                   "masked": len(gv.get("tokens", [])),
+                   "output_masked": sum(a.get("masked", 0)
+                                        for a in gv.get("output_actions", [])),
+                   "redacted": True} if gv else None),
+        "idempotent": True,
     }
 
 
