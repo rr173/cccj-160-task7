@@ -2,6 +2,7 @@
 
 <div class="note">
   <a href="/families/{{ req.family_id }}">← 返回 {{ req.family_name }}</a> ·
+  <a href="/requests/{{ req.request_id }}/review">🔏 敏感内容复核 →</a> ·
   旧请求始终按<b>原元数据</b>复核，不受当前线上指针与放量批次权重变化影响。
   原请求固化三元组：版本 <span class="mono small">{{ req.version_id }}</span> ·
   模型 <span class="mono small">{{ req.model_id }}</span> ·
@@ -11,10 +12,28 @@
   · 代次 <span class="mono small">{{ req.rollout_generation }}</span>。{% endif %}
 </div>
 
+{% if mask %}
+<div class="card">
+  <h2>敏感内容隔离（请求固定版本 v{{ mask.rule_version_no }}）
+    <a class="chip" href="/requests/{{ req.request_id }}/review">隔离复核 / 原值还原 →</a>
+  </h2>
+  <div class="kv">
+    <div>固定规则版本</div><div class="mono small">{{ mask.rule_version_id }}
+      （规则更新不改写本请求）</div>
+    <div>处置</div><div>
+      {% if mask.hit_action == 'deny' %}<span class="badge b-failed_eval">deny 已阻断</span>
+      {% elif mask.hit_action == 'redact' %}<span class="badge b-active">redact 已替换</span>
+      {% else %}<span class="mut">启用规则但未命中</span>{% endif %}</div>
+    <div>遮盖条目</div><div>{{ mask.token_count }} 条（仅密文；还原走单次凭据）</div>
+  </div>
+  <p class="small">下方"原请求存档"中的输入/提示均为<b>遮盖后内容</b>；精确重演直接复用
+    该固化版本，反事实新输入也按同一规则版本隔离。</p>
+</div>
+{% endif %}
+
 {% if authz.exists %}
 <div class="card">
-  <h2>工具扩权授权快照（命中时固化，历史结论只按此复查）</h2>
-  {% if authz.required %}
+  <h2>工具扩权授权快照（命中时固化，历史结论只按此复查）</h2>  {% if authz.required %}
   <div class="kv">
     <div>命中时状态</div><div><span class="badge b-{{ authz.state_at_check }}">
       {{ authz.state_at_check }}</span> · 复核时刻

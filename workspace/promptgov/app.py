@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from . import config, evidence, llm, services
+from . import mask_service
 from .db import audit, get_conn, init_db
 from .jinja_compat import render_text
 
@@ -258,6 +259,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             self._err(exc)
 
+    def do_DELETE(self):  # noqa: N802
+        try:
+            self._route("DELETE")
+        except Exception as exc:  # noqa: BLE001
+            self._err(exc)
+
     def _route(self, method: str):
         self._is_page = False
         parsed = urlparse(self.path)
@@ -279,6 +286,12 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/requests/([\w.-]+)/replay", p)
         if method == "GET" and m:
             return self._page_replay(m.group(1), q)
+        m = re.fullmatch(r"/families/([\w.-]+)/mask", p)
+        if method == "GET" and m:
+            return self._page_mask_config(m.group(1), q)
+        m = re.fullmatch(r"/requests/([\w.-]+)/review", p)
+        if method == "GET" and m:
+            return self._page_request_review(m.group(1), q)
         m = re.fullmatch(r"/families/([\w.-]+)/rollout", p)
         if method == "GET" and m:
             return self._page_rollout(m.group(1), q)
@@ -338,6 +351,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._ui_feedback(p.split("/")[3])
         if method == "POST" and re.fullmatch(r"/ui/requests/[\w.-]+/replay", p):
             return self._ui_replay(p.split("/")[3])
+        if method == "POST" and re.fullmatch(
+                r"/ui/families/[\w.-]+/mask/rules", p):
+            return self._ui_mask_create_rule(p.split("/")[3])
+        if method == "POST" and re.fullmatch(
+                r"/ui/mask/rules/[\w.-]+/activate", p):
+            return self._ui_mask_activate(p.split("/")[4])
+        if method == "POST" and re.fullmatch(
+                r"/ui/families/[\w.-]+/mask/reviewers", p):
+            return self._ui_mask_add_reviewer(p.split("/")[3])
+        if method == "POST" and re.fullmatch(
+                r"/ui/families/[\w.-]+/mask/reviewers/[\w.@-]+/remove", p):
+            parts = p.split("/")
+            return self._ui_mask_remove_reviewer(parts[3], unquote(parts[6]))
+        if method == "POST" and re.fullmatch(
+                r"/ui/requests/[\w.-]+/mask/reveal-tokens", p):
+            return self._ui_mask_issue(p.split("/")[3])
+        if method == "POST" and re.fullmatch(
+                r"/ui/requests/[\w.-]+/mask/reveal", p):
+            return self._ui_mask_reveal(p.split("/")[3])
+        if method == "POST" and re.fullmatch(
+                r"/ui/mask/reveal-tokens/[\w.-]+/revoke", p):
+            return self._ui_mask_revoke_token(p.split("/")[4])
         if method == "POST" and p == "/ui/families":
             return self._ui_create_family()
         if method == "POST" and p == "/ui/evidence/exports":
@@ -529,6 +564,79 @@ class Handler(BaseHTTPRequestHandler):
                 bool(b.get("inject_drift", False))), 201)
         if method == "GET" and p == "/api/requests":
             return self._json(services.list_requests(q.get("family", [None])[0]))
+
+        # ------------------------------------------------ 敏感内容隔离 JSON API
+        if method == "GET" and re.fullmatch(r"/api/families/[\w.-]+/mask/rules", p):
+            fid = p.split("/")[3]
+            return self._json(mask_service.list_rule_versions(fid))
+        if method == "POST" and re.fullmatch(r"/api/families/[\w.-]+/mask/rules", p):
+            fid = p.split("/")[3]
+            b = _json_body(self)
+            return self._json(mask_service.create_rule_version(
+                fid, b.get("action", "redact"), b.get("rules", []),
+                b.get("actor", "admin"), b.get("note", ""),
+                bool(b.get("activate", True))), 201)
+        if method == "POST" and re.fullmatch(
+                r"/api/mask/rules/[\w.-]+/activate", p):
+            rid = p.split("/")[4]
+            b = _json_body(self)
+            return self._json(mask_service.activate_rule_version(
+                rid, b.get("actor", "admin")))
+        if method == "POST" and re.fullmatch(r"/api/families/[\w.-]+/mask/preview", p):
+            fid = p.split("/")[3]
+            b = _json_body(self)
+            return self._json(mask_service.preview(
+                fid, b.get("action", "redact"), b.get("rules", []),
+                b.get("inputs", {}), b.get("version_id"), b.get("actor", "admin")))
+        if method == "GET" and re.fullmatch(
+                r"/api/families/[\w.-]+/mask/reviewers", p):
+            fid = p.split("/")[3]
+            return self._json(mask_service.list_reviewers(fid))
+        if method == "POST" and re.fullmatch(
+                r"/api/families/[\w.-]+/mask/reviewers", p):
+            fid = p.split("/")[3]
+            b = _json_body(self)
+            return self._json(mask_service.add_reviewer(
+                fid, b["reviewer"], b.get("actor", "admin"), b.get("note", "")), 201)
+        if method == "DELETE" and re.fullmatch(
+                r"/api/families/[\w.-]+/mask/reviewers/[\w.@-]+", p):
+            parts = p.split("/")
+            fid, reviewer = parts[3], parts[-1]
+            b = (_json_body(self) if self.headers.get("Content-Length") not in (None, "0")
+                 else {"actor": "admin"})
+            return self._json(mask_service.remove_reviewer(
+                fid, unquote(reviewer), b.get("actor", "admin")))
+        if method == "GET" and re.fullmatch(
+                r"/api/requests/[\w.-]+/mask", p):
+            rid = p.split("/")[3]
+            return self._json(mask_service.request_mask_view(rid))
+        if method == "GET" and re.fullmatch(
+                r"/api/requests/[\w.-]+/mask/audit", p):
+            rid = p.split("/")[3]
+            return self._json(mask_service.request_audit(rid))
+        if method == "POST" and re.fullmatch(
+                r"/api/requests/[\w.-]+/mask/reveal-tokens", p):
+            rid = p.split("/")[3]
+            b = _json_body(self)
+            return self._json(mask_service.issue_reveal_token(
+                rid, b["reviewer"], b.get("actor", b["reviewer"]),
+                b.get("ttl_seconds")), 201)
+        if method == "GET" and re.fullmatch(
+                r"/api/requests/[\w.-]+/mask/reveal-tokens", p):
+            rid = p.split("/")[3]
+            return self._json(mask_service.list_reveal_tokens(rid))
+        if method == "POST" and re.fullmatch(
+                r"/api/requests/[\w.-]+/mask/reveal", p):
+            rid = p.split("/")[3]
+            b = _json_body(self)
+            return self._json(mask_service.consume_reveal_token(
+                rid, b["token"], b["reviewer"], b.get("actor")))
+        if method == "POST" and re.fullmatch(
+                r"/api/mask/reveal-tokens/[\w.-]+/revoke", p):
+            tid = p.split("/")[4]
+            b = _json_body(self)
+            return self._json(mask_service.revoke_reveal_token(
+                tid, b.get("actor", "admin")))
 
         # ------------------------------------------------ 证据包 JSON API
         return self._route_evidence(method, p, q)
@@ -890,6 +998,107 @@ class Handler(BaseHTTPRequestHandler):
                "flash": self._flash(q)}
         self._html(page(f"自动止损 · {ro_view['candidate_semver']}", "stoploss.html", ctx))
 
+    # ============================================================ 敏感内容隔离页面
+    def _page_mask_config(self, fid, q):
+        self._is_page = True
+        family = services.get_family(fid)
+        versions_ = mask_service.list_rule_versions(fid)
+        rows = []
+        active_no = None
+        for r in versions_:
+            d = {"rule_version_id": r["rule_version_id"], "version_no": r["version_no"],
+                 "status": r["status"], "action": r["action"],
+                 "is_active": r["is_active"], "rules_hash": r["rules_hash"],
+                 "short_hash": _short(r["rules_hash"]),
+                 "rules": r["rules"], "n_rules": len(r["rules"]),
+                 "note": r["note"], "created_by": r["created_by"],
+                 "created_at": r["created_at"], "activated_at": r["activated_at"]}
+            rows.append(d)
+            if r["is_active"]:
+                active_no = r["version_no"]
+        reviewers = mask_service.list_reviewers(fid)
+        versions = services.list_versions(fid)
+        version_opts = [{"version_id": v["version_id"], "semver": v["semver"]}
+                        for v in versions]
+        # 预览结果（仅回显给管理员，不落库；?preview=1 且表单通过 GET 不实现，
+        # 预览走同页 JS fetch 由页面内脚本完成；这里给默认样本）
+        sample_inputs = json.dumps(
+            {"customer_text": "客户电话 13800001111 要求退款，邮箱 a@b.com",
+             "lang": "zh"}, ensure_ascii=False, indent=2)
+        default_rules = json.dumps([
+            {"rule_id": "phone", "field": "customer_text", "match": "literal",
+             "pattern": "13800001111", "replacement": "[手机号]"},
+            {"rule_id": "email", "field": "*", "match": "literal",
+             "pattern": "a@b.com", "replacement": "[邮箱]"},
+        ], ensure_ascii=False, indent=2)
+        # 最近命中遮盖的请求
+        hits = [dict(r) for r in get_conn().execute(
+            "SELECT h.request_id,h.rule_version_no,h.action,h.token_count,h.created_at,"
+            "v.semver AS semver FROM mask_hits h LEFT JOIN versions v "
+            "ON v.version_id=(SELECT version_id FROM requests WHERE request_id=h.request_id) "
+            "WHERE h.family_id=? ORDER BY h.id DESC LIMIT 15", (fid,)).fetchall()]
+        ctx = {"family": family, "rules": rows, "active_no": active_no,
+               "reviewers": reviewers, "version_opts": version_opts,
+               "sample_inputs": sample_inputs, "default_rules": default_rules,
+               "hits": hits, "flash": self._flash(q)}
+        self._html(page(f"敏感内容隔离 · {family['name']}", "mask_config.html", ctx))
+
+    def _page_request_review(self, rid, q):
+        self._is_page = True
+        req = services.get_request(rid)
+        family = services.get_family(req["family_id"])
+        mask = mask_service.request_mask_view(rid)
+        reviewers = mask_service.list_reviewers(req["family_id"], active_only=True)
+        entries = []
+        rule_rows = []
+        if mask:
+            rule_rows = mask["rules"]
+            entries = [{"token": e["token"], "field": e["field"],
+                        "rule_id": e["rule_id"], "replacement": e["replacement"]}
+                       for e in mask["entries"]]
+        tokens = []
+        if mask:
+            for t in mask["tokens"]:
+                tokens.append({"token_id": t["token_id"], "reviewer": t["reviewer"],
+                               "status": t["status"], "expires_at": t["expires_at"],
+                               "created_at": t["created_at"],
+                               "consumed_at": t["consumed_at"] or "",
+                               "consumed_by": t["consumed_by"] or ""})
+        audit_rows = mask_service.request_audit(rid)
+        ctx = {"req": {"request_id": rid, "family_id": req["family_id"],
+                       "family_name": family["name"], "version_id": req["version_id"],
+                       "model_id": req["model_id"], "created_at": req["created_at"],
+                       "inputs_json": json.dumps(json.loads(req["inputs_json"]),
+                                                 ensure_ascii=False, indent=2),
+                       "output": req["output"],
+                       "rendered_prompt": req["rendered_prompt"],
+                       "mask_action": req["mask_action"],
+                       "mask_rule_version_no": req["mask_rule_version_no"]},
+               "has_mask": bool(mask), "mask": mask or {},
+               "entries": entries, "rule_rows": rule_rows,
+               "reviewers": reviewers, "tokens": tokens,
+               "audit_rows": audit_rows,
+               "reveal": None, "reveal_error": "",
+               "replay_href": f"/requests/{rid}/replay",
+               "flash": self._flash(q)}
+        # 凭据消费结果（一次性）：?consumed=<token_id> 时展示当次响应落库的原值。
+        # 页面刷新/分享链接都不会再次暴露（值只在 POST 响应的内存中渲染这一次）。
+        self._html(page("请求敏感内容复核", "request_review.html", ctx))
+
+    def _page_reveal_result(self, rid, consume: dict):
+        """凭据消费成功后的一次性原值页（仅在 POST 当场渲染，不落库、不缓存）。"""
+        self._is_page = True
+        req = services.get_request(rid)
+        family = services.get_family(req["family_id"])
+        values = [{"field": v["field"], "rule_id": v["rule_id"], "token": v["token"],
+                   "replacement": v["replacement"], "value": v["value"]}
+                  for v in consume["values"]]
+        ctx = {"req": {"request_id": rid, "family_id": req["family_id"],
+                       "family_name": family["name"], "created_at": req["created_at"]},
+               "values": values, "consumed_at": consume["consumed_at"],
+               "reviewer": consume["reviewer"], "token_id": consume["token_id"]}
+        self._html(page("原值还原（一次性）", "reveal_result.html", ctx))
+
     def _page_replay(self, rid, q):
         self._is_page = True
         req = services.get_request(rid)
@@ -946,6 +1155,8 @@ class Handler(BaseHTTPRequestHandler):
                        "rollout_id": req.get("rollout_id") or "",
                        "rollout_generation": req.get("rollout_generation"),
                        "params_fingerprint": req.get("params_fingerprint") or "",
+                       "mask_action": req.get("mask_action") or "",
+                       "mask_rule_version_no": req.get("mask_rule_version_no") or 0,
                        "params_json": json.dumps(json.loads(req["params_json"]),
                                                  ensure_ascii=False, indent=2)
                        if req.get("params_json") else "",
@@ -953,6 +1164,7 @@ class Handler(BaseHTTPRequestHandler):
                "rollout": rollout,
                "feedback": feedback_card,
                "authz": _authz_card(authz),
+               "mask": mask_service.request_mask_view(rid),
                "versions": versions, "models": llm.list_models(),
                "replays": rpl_rows, "result": None, "flash": self._flash(q)}
         # 若带 ?rpl= 则展示该报告详情
@@ -1117,8 +1329,24 @@ class Handler(BaseHTTPRequestHandler):
                      "same_model": r["same_model"], "same_input": r["same_input"],
                      "same_output": r["same_output"], "created_at": r["created_at"]}
                     for r in view.replays(rid)]
+        # 包内隔离历史检查：固定规则版本 + 密文遮盖映射（包内无还原凭据，不能解密）
+        pack_mask = None
+        if req.get("mask_rule_version_id"):
+            mrv = view.mask_rule(req["mask_rule_version_id"])
+            hit = view.mask_hit(rid)
+            pack_mask = {
+                "rule_version_no": req["mask_rule_version_no"],
+                "rule_version_id": req["mask_rule_version_id"],
+                "rule_in_pack": bool(mrv),
+                "action": req.get("mask_action") or (hit["action"] if hit else ""),
+                "rules_hash": mrv["rules_hash"] if mrv else "",
+                "rules": json.loads(mrv["rules_json"]) if mrv else [],
+                "hit": hit,
+                "entries": (hit["entries"] if hit else []),
+            }
         ctx = {
             "pid": pid, "family": family, "rollout": rollout,
+            "pack_mask": pack_mask,
             "req": {"request_id": rid, "family_id": req["family_id"],
                     "family_name": family["name"], "version_id": req["version_id"],
                     "semver": semvers.get(req["version_id"], "?"),
@@ -1338,6 +1566,70 @@ class Handler(BaseHTTPRequestHandler):
         res = services.replay(rid, f.get("actor", "web") or "web",
                               ov_version, ov_model, override_inputs, inject)
         self._redirect(f"/requests/{rid}/replay?rpl={res['replay_id']}")
+
+    # ------------------------------------------------ 敏感内容隔离 UI
+    def _ui_mask_create_rule(self, fid):
+        self._is_page = True
+        f = _form(self)
+        rules = _jloads_field(f, "rules_json", [])
+        mask_service.create_rule_version(
+            fid, f.get("action", "redact"), rules,
+            f.get("actor", "admin") or "admin", f.get("note", ""),
+            activate=(f.get("activate", "1") == "1"))
+        self._redirect(f"/families/{fid}/mask")
+
+    def _ui_mask_activate(self, rule_version_id):
+        self._is_page = True
+        f = _form(self)
+        rv = mask_service.activate_rule_version(
+            rule_version_id, f.get("actor", "admin") or "admin")
+        self._redirect(f"/families/{rv['family_id']}/mask")
+
+    def _ui_mask_add_reviewer(self, fid):
+        self._is_page = True
+        f = _form(self)
+        mask_service.add_reviewer(fid, f["reviewer"].strip(),
+                                  f.get("actor", "admin") or "admin",
+                                  f.get("note", ""))
+        self._redirect(f"/families/{fid}/mask#reviewers")
+
+    def _ui_mask_remove_reviewer(self, fid, reviewer):
+        self._is_page = True
+        f = _form(self)
+        mask_service.remove_reviewer(fid, reviewer, f.get("actor", "admin") or "admin")
+        self._redirect(f"/families/{fid}/mask#reviewers")
+
+    def _ui_mask_issue(self, rid):
+        self._is_page = True
+        f = _form(self)
+        ttl = int(f["ttl_seconds"]) if f.get("ttl_seconds") else None
+        res = mask_service.issue_reveal_token(
+            rid, f["reviewer"].strip(), f.get("actor", f["reviewer"]) or f["reviewer"],
+            ttl)
+        # 一次性凭据只在重定向后的 flash 中展示这一次（消费前请复核人即时保存）。
+        msg = (f"短期凭据已签发（{res['ttl_seconds']}s，单次消费，过期 {res['expires_at']}）。"
+               f"明文凭据仅此一次：{res['token']}")
+        self._redirect(f"/requests/{rid}/review?err=" + quote(msg))
+
+    def _ui_mask_reveal(self, rid):
+        self._is_page = True
+        f = _form(self)
+        try:
+            res = mask_service.consume_reveal_token(
+                rid, f.get("token", ""), f.get("reviewer", "").strip(),
+                f.get("actor") or f.get("reviewer", "").strip() or "web")
+        except Exception as exc:  # noqa: BLE001 - 失败回到复核页提示，不暴露原值
+            self._redirect(f"/requests/{rid}/review?err=" + quote(str(exc)[:200]))
+            return
+        # 成功：当场渲染一次性原值页（不再经 URL/flash 传递明文）
+        self._page_reveal_result(rid, res)
+
+    def _ui_mask_revoke_token(self, token_id):
+        self._is_page = True
+        f = _form(self)
+        t = mask_service.revoke_reveal_token(token_id, f.get("actor", "admin") or "admin")
+        back = f.get("back", "/evidence")
+        self._redirect(back)
 
     def _ui_export_pack(self):
         self._is_page = True

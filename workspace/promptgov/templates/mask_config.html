@@ -1,0 +1,141 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/families/{{ family.family_id }}">← 返回 {{ family.name }}</a> ·
+  敏感内容隔离规则按<b>模板族版本化</b>：每次发布生成不可变新版本并翻转族上唯一指针；
+  线上请求、评估回放与证据包复核共用同一确定规则版本。规则更新只影响之后的新请求，
+  <b>在途与历史请求永远按其固定版本复查</b>。数据库审计与导出文件不含明文，原值仅以
+  密文逐请求保存，只有授权复核人用<b>绑定请求、短期、单次消费</b>的凭据还原。
+</div>
+
+<div class="grid g2">
+  <div class="card">
+    <h2>规则版本历史（不可变）
+      {% if active_no %}<span class="chip">当前生效 v{{ active_no }}</span>{% else %}
+      <span class="chip warn">未启用隔离</span>{% endif %}
+    </h2>
+    <table>
+      <thead><tr><th>版本</th><th>策略</th><th>规则</th><th>状态</th><th>指纹</th><th></th></tr></thead>
+      <tbody>
+      {% for r in rules %}
+        <tr>
+          <td><b>v{{ r.version_no }}</b><div class="small">{{ r.created_at }} · {{ r.created_by }}</div></td>
+          <td>{% if r.action == 'deny' %}<span class="badge b-failed_eval">deny 阻断</span>
+            {% else %}<span class="badge b-active">redact 替换</span>{% endif %}</td>
+          <td class="small">{% for x in r.rules %}<span class="chip">{{ x.rule_id }}:{{ x.field }}</span>
+            {% endfor %}<div class="small mut">{{ r.note }}</div></td>
+          <td>{% if r.is_active %}<span class="badge b-active">active</span>
+            {% else %}<span class="badge b-superseded">{{ r.status }}</span>{% endif %}</td>
+          <td class="mono small">{{ r.short_hash }}</td>
+          <td>{% if not r.is_active %}
+            <form method="post" action="/ui/mask/rules/{{ r.rule_version_id }}/activate">
+              <input type="hidden" name="actor" value="admin">
+              <button class="ghost" type="submit">切回此版本</button>
+            </form>{% else %}<span class="small mut">生效中</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+
+    <h3>最近隔离命中（逐请求，仅密文）</h3>
+    <table>
+      <thead><tr><th>请求</th><th>规则版本</th><th>动作</th><th>遮盖数</th><th>时间</th><th></th></tr></thead>
+      <tbody>
+      {% for h in hits %}
+        <tr><td class="mono small"><a href="/requests/{{ h.request_id }}/review">{{ h.request_id }}</a></td>
+          <td class="small">v{{ h.rule_version_no }}</td>
+          <td>{% if h.action == 'deny' %}<span class="badge b-failed_eval">deny</span>
+            {% else %}<span class="badge b-active">redact</span>{% endif %}</td>
+          <td class="small">{{ h.token_count }}</td>
+          <td class="small">{{ h.created_at }}</td>
+          <td><a href="/requests/{{ h.request_id }}/review">复核</a></td></tr>
+      {% endfor %}
+      {% if not hits %}
+        <tr><td colspan="6" class="small mut">暂无命中记录</td></tr>
+      {% endif %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>发布新规则版本</h2>
+    <form method="post" action="/ui/families/{{ family.family_id }}/mask/rules">
+      <label>策略动作</label>
+      <select name="action">
+        <option value="redact">redact 替换（遮盖后参与模板渲染）</option>
+        <option value="deny">deny 阻断（命中即拒绝，不接触模型）</option>
+      </select>
+      <label>规则集 JSON
+        <span class="small">（rule_id 唯一；field 为契约变量名或 * 表示任意字符串变量；
+        match=literal 字面量子串；replacement 可空）</span></label>
+      <textarea name="rules_json" style="min-height:180px">{{ default_rules }}</textarea>
+      <label>说明</label>
+      <input name="note" placeholder="如：按合规要求屏蔽手机号/邮箱">
+      <label>操作人</label>
+      <input name="actor" value="admin">
+      <label class="small" style="display:flex;gap:6px;align-items:center">
+        <input type="checkbox" name="activate" value="1" checked style="width:auto">
+        立即发布并翻转当前生效指针（旧版本自动 retired）</label>
+      <div class="row" style="margin-top:10px"><button>发布新版本</button></div>
+    </form>
+
+    <h2 id="preview">隔离预览（不落库、不写含明文审计）</h2>
+    <p class="small">在样本输入上当场识别/替换并预览"替换后参与渲染"的提示。
+      预览结果只在本次响应中回显。</p>
+    <label>用哪个版本的模板渲染预览（可选）</label>
+    <select id="pv-version">
+      <option value="">（仅看替换后输入）</option>
+      {% for v in version_opts %}<option value="{{ v.version_id }}">v{{ v.semver }}</option>{% endfor %}
+    </select>
+    <label>样本输入 JSON</label>
+    <textarea id="pv-inputs" style="min-height:120px">{{ sample_inputs }}</textarea>
+    <div class="row" style="margin:8px 0">
+      <button type="button" onclick="doPreview('redact')">预览 redact</button>
+      <button type="button" class="ghost" onclick="doPreview('deny')">预览 deny</button>
+    </div>
+    <pre id="pv-out" style="max-height:260px">（点击上方按钮）</pre>
+  </div>
+</div>
+
+<div class="card" id="reviewers">
+  <h2>获授权原值复核人（按模板族）</h2>
+  <p class="small">只有名册内的<b>启用</b>复核人能为该族请求申请/使用短期还原凭据；
+    凭据仍绑定具体请求且单次消费。</p>
+  <table>
+    <thead><tr><th>复核人</th><th>说明</th><th>状态</th><th></th></tr></thead>
+    <tbody>
+    {% for rv in reviewers %}
+      <tr><td class="mono">{{ rv.reviewer }}</td><td class="small">{{ rv.note }}</td>
+        <td>{% if rv.active %}<span class="badge b-active">启用</span>
+          {% else %}<span class="badge b-superseded">停用</span>{% endif %}</td>
+        <td>{% if rv.active %}
+          <form method="post"
+                action="/ui/families/{{ family.family_id }}/mask/reviewers/{{ rv.reviewer }}/remove">
+            <input type="hidden" name="actor" value="admin">
+            <button class="danger" type="submit">停用</button>
+          </form>{% endif %}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <form method="post" action="/ui/families/{{ family.family_id }}/mask/reviewers"
+        class="grid g3" style="grid-template-columns:1fr 2fr auto;margin-top:10px">
+    <input name="reviewer" placeholder="复核人标识，如 sec-oncall" required>
+    <input name="note" placeholder="说明">
+    <button>添加复核人</button>
+  </form>
+</div>
+
+<script>
+async function doPreview(action){
+  let rules, inputs;
+  try { rules = JSON.parse(document.querySelector('[name=rules_json]').value); }
+  catch(e){ document.getElementById('pv-out').textContent='规则 JSON 非法: '+e; return; }
+  try { inputs = JSON.parse(document.getElementById('pv-inputs').value); }
+  catch(e){ document.getElementById('pv-out').textContent='输入 JSON 非法: '+e; return; }
+  const resp = await fetch('/api/families/{{ family.family_id }}/mask/preview', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({action, rules, inputs, actor:'web',
+      version_id: document.getElementById('pv-version').value || null})});
+  document.getElementById('pv-out').textContent = JSON.stringify(await resp.json(), null, 2);
+}
+</script>

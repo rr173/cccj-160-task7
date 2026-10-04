@@ -45,6 +45,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Iterator
 
 from . import core
+from . import masking
 from . import db as dbmod
 from .db import get_conn, snapshot_tx, write_tx
 
@@ -92,7 +93,7 @@ def bind_db(path: str, init_schema: bool = True) -> Iterator[sqlite3.Connection]
         conn.close()
 
 # 复用服务层异常分类（app 层据此映射 400/404/409）
-from .services import Conflict, DomainError, NotFound  # noqa: F401
+from .errors import Conflict, DomainError, NotFound  # noqa: F401
 
 FORMAT = "promptgov-evidence-pack/1"
 DEFAULT_SHARD_BYTES = 1024 * 1024  # 数据分片默认 1 MiB
@@ -102,7 +103,8 @@ TABLES = (
     "families", "versions", "approvals", "testsets", "testcases",
     "eval_runs", "eval_cases", "requests", "rollouts",
     "stoploss_configs", "stoploss_windows", "stoploss_triggers",
-    "feedback_receipts", "replays", "audit_log",
+    "feedback_receipts", "replays",
+    "mask_rule_versions", "mask_hits", "mask_reviewers", "audit_log",
 )
 # 各表主键列
 PK = {
@@ -111,21 +113,28 @@ PK = {
     "eval_cases": "id", "requests": "request_id", "rollouts": "rollout_id",
     "stoploss_configs": "rollout_id", "stoploss_windows": "window_id",
     "stoploss_triggers": "trigger_id", "feedback_receipts": "feedback_id",
-    "replays": "replay_id", "audit_log": "id",
+    "replays": "replay_id",
+    "mask_rule_versions": "rule_version_id", "mask_hits": "id",
+    "mask_reviewers": "id", "audit_log": "id",
 }
 # 对象出边引用：表 -> (字段, 指向表)，空值/空字符串不产生引用。
 # 这些是**结构边**：导出时是否把目标纳入包由范围闭包决定（见 _collect_scope）。
 # 窄范围（version/requests）下，落在选择集合之外的结构边不展开集合，而是记入
 # 清单的 external_refs（边界外部引用），验证侧据此区分"断链"与"范围边界"。
+# 注意：短期还原凭据 mask_reveal_tokens **故意不在证据包内**——凭据可还原原值，
+# 导出文件不得携带任何还原能力；审计明细也只含字段/规则 id/计数。
 REF_FIELDS: dict[str, list[tuple[str, str]]] = {
-    "families": [("active_version_id", "versions")],
+    "families": [("active_version_id", "versions"),
+                 ("mask_active_version_id", "mask_rule_versions")],
     "versions": [("family_id", "families")],
     "approvals": [("version_id", "versions")],
     "testsets": [("family_id", "families")],
     "testcases": [("testset_id", "testsets")],
-    "eval_runs": [("version_id", "versions"), ("testset_id", "testsets")],
+    "eval_runs": [("version_id", "versions"), ("testset_id", "testsets"),
+                  ("mask_rule_version_id", "mask_rule_versions")],
     "eval_cases": [("run_id", "eval_runs"), ("case_id", "testcases")],
-    "requests": [("version_id", "versions"), ("rollout_id", "rollouts")],
+    "requests": [("version_id", "versions"), ("rollout_id", "rollouts"),
+                 ("mask_rule_version_id", "mask_rule_versions")],
     "rollouts": [("family_id", "families"), ("candidate_version_id", "versions"),
                  ("base_version_id", "versions")],
     "stoploss_configs": [("rollout_id", "rollouts")],
@@ -136,6 +145,9 @@ REF_FIELDS: dict[str, list[tuple[str, str]]] = {
     "feedback_receipts": [("rollout_id", "rollouts"), ("window_id", "stoploss_windows"),
                           ("request_id", "requests")],
     "replays": [("request_id", "requests")],
+    "mask_rule_versions": [("family_id", "families")],
+    "mask_hits": [("request_id", "requests"), ("rule_version_id", "mask_rule_versions")],
+    "mask_reviewers": [("family_id", "families")],
     "audit_log": [],
 }
 
@@ -150,6 +162,8 @@ AUDIT_ENTITY_TABLE = {
     "testset": "testsets", "request": "requests", "replay": "replays",
     "rollout": "rollouts", "stoploss_window": "stoploss_windows",
     "stoploss_trigger": "stoploss_triggers", "approval": "approvals",
+    "mask_rule": "mask_rule_versions", "mask_hit": "mask_hits",
+    "mask_reviewer": "mask_reviewers",
     "evidence_pack": None,
 }
 
@@ -251,6 +265,14 @@ def _summary(table: str, row: dict, semvers: dict[str, str]) -> str:
         return f"{rid} {row['outcome']} req={row['request_id'][:12]}"
     if table == "replays":
         return f"{row['mode']} {row['verdict']}"
+    if table == "mask_rule_versions":
+        return (f"v{row['version_no']} {row['status']} action={row['action']} "
+                f"rules={len(json.loads(row['rules_json']))} hash={row['rules_hash'][:10]}")
+    if table == "mask_hits":
+        return (f"request={row['request_id'][:12]} rule_v{row['rule_version_no']} "
+                f"{row['action']} tokens={row['token_count']}（仅密文）")
+    if table == "mask_reviewers":
+        return f"{row['reviewer']} active={row['active']}"
     if table == "audit_log":
         return f"{row['action']} {row['entity']}/{row['entity_id']}"
     return rid
@@ -266,18 +288,22 @@ def _ids(clause_result) -> set[str]:
 # 灰度与风控记录夹带进来；窄范围走 _collect_scope 内显式的最小依赖展开。
 CHILDREN: dict[str, list[tuple[str, str]]] = {
     "families": [("versions", "family_id"), ("testsets", "family_id"),
-                 ("requests", "family_id"), ("rollouts", "family_id")],
+                 ("requests", "family_id"), ("rollouts", "family_id"),
+                 ("mask_rule_versions", "family_id"), ("mask_reviewers", "family_id")],
     "testsets": [("testcases", "testset_id")],
     "versions": [("approvals", "version_id"), ("eval_runs", "version_id"),
                  ("requests", "version_id")],
     "eval_runs": [("eval_cases", "run_id")],
-    "requests": [("replays", "request_id")],
+    "requests": [("replays", "request_id"), ("mask_hits", "request_id")],
     "rollouts": [("stoploss_configs", "rollout_id"),
                  ("stoploss_windows", "rollout_id"),
                  ("stoploss_triggers", "rollout_id"),
                  ("feedback_receipts", "rollout_id")],
     "stoploss_windows": [("feedback_receipts", "window_id")],
     "stoploss_triggers": [],
+    "mask_rule_versions": [],
+    "mask_hits": [],
+    "mask_reviewers": [],
 }
 
 
@@ -388,6 +414,11 @@ def _collect_version_scope(c, chosen: dict[str, set[str]], vid: str) -> None:
     chosen["approvals"] |= _fetch_ids(c, "approvals", "version_id", {vid})
     run_ids = _fetch_ids(c, "eval_runs", "version_id", {vid})
     chosen["eval_runs"] |= run_ids
+    # 评估证据固定的隔离规则版本（回放必须能按同一规则版本复核）
+    for r in c.execute(
+            "SELECT DISTINCT mask_rule_version_id AS x FROM eval_runs "
+            "WHERE version_id=? AND mask_rule_version_id<>''", (vid,)).fetchall():
+        chosen["mask_rule_versions"].add(str(r["x"]))
     # 评估证据依赖的固定测试集（共享测试集：随评估整组带其用例）
     testset_ids: set[str] = set()
     vals = list(run_ids)
@@ -407,21 +438,35 @@ def _collect_version_scope(c, chosen: dict[str, set[str]], vid: str) -> None:
     chosen["requests"] |= req_ids
     for rid in req_ids:
         chosen["replays"] |= _fetch_ids(c, "replays", "request_id", {rid})
+        chosen["mask_hits"] |= _fetch_ids(c, "mask_hits", "request_id", {rid})
+    # 这些调用固定的隔离规则版本（族当前指针不展开，规则版本作最小依赖随包）
+    for r in c.execute(
+            "SELECT DISTINCT mask_rule_version_id AS x FROM requests "
+            "WHERE version_id=? AND mask_rule_version_id<>''", (vid,)).fetchall():
+        chosen["mask_rule_versions"].add(str(r["x"]))
     # 仅这些调用已入账的回执（其 rollout/window 出边不展开，作为边界引用）
     chosen["feedback_receipts"] |= _fetch_ids(
         c, "feedback_receipts", "request_id", req_ids)
 
 
 def _collect_requests_scope(c, chosen: dict[str, set[str]], rids: list[str]) -> None:
-    """requests 范围的**最小**依赖闭包：所选调用 → 其历史重演 → 各调用实际
-    命中构件（版本四要素，复查三元组/绑定模型必需）→ 版本所属族头（命名）→
-    已入账回执。命中版本的审批/评估、放量批次、止损配置/窗口/触发均不纳入。"""
+    """requests 范围的**最小**依赖闭包：所选调用 → 其历史重演/逐请求遮盖映射 →
+    各调用实际命中构件（版本四要素，复查三元组/绑定模型必需）与**固定的隔离规则
+    版本** → 版本所属族头（命名）→ 已入账回执。命中版本的审批/评估、放量批次、
+    止损配置/窗口/触发均不纳入。短期还原凭据一律不随包（导出文件不带还原能力）。"""
     req_ids = set(rids)
     chosen["requests"] |= req_ids
     for rid in req_ids:
         chosen["replays"] |= _fetch_ids(c, "replays", "request_id", {rid})
+        chosen["mask_hits"] |= _fetch_ids(c, "mask_hits", "request_id", {rid})
     chosen["feedback_receipts"] |= _fetch_ids(
         c, "feedback_receipts", "request_id", req_ids)
+    # 调用固定的隔离规则版本（导出后可按同版本做历史检查，但密文无法在包外还原）
+    for r in c.execute(
+            "SELECT DISTINCT mask_rule_version_id AS x FROM requests "
+            "WHERE request_id IN (%s) AND mask_rule_version_id<>''"
+            % ",".join("?" * len(req_ids)), list(req_ids)).fetchall():
+        chosen["mask_rule_versions"].add(str(r["x"]))
     # 命中版本（出边）与族头：只取标识行，不展开版本的审批/评估/其它调用
     vals = list(req_ids)
     version_ids: set[str] = set()
@@ -901,6 +946,105 @@ def verify_bytes(file_bytes: bytes) -> dict:
         if not rec_of("rollouts", trg.get("rollout_id")):
             _err(errors, "trigger_rollout_missing", f"触发快照 {trg_id} 缺少批次")
 
+    # —— 敏感内容隔离的历史不变量（导入后历史检查）——
+    # 1) 规则版本：rules_hash 必须能由 action+rules 重算；族指针指向的版本须在
+    #    包内或显式声明边界；eval_runs/requests 固定的版本号必须与版本行一致。
+    for rv_id, rv in ((k[1], r) for k, r in by_key.items()
+                      if k[0] == "mask_rule_versions"):
+        try:
+            rules = json.loads(rv.get("rules_json", "[]"))
+            re_hash = masking.rules_fingerprint(rv["action"], rules)
+            if re_hash != rv.get("rules_hash"):
+                _err(errors, "mask_rules_hash_mismatch",
+                     f"隔离规则版本 {rv_id} 规则重哈希与 rules_hash 不符（规则被改）")
+        except Exception as exc:  # noqa: BLE001
+            _err(errors, "mask_rules_fields", f"隔离规则版本 {rv_id} 字段损坏：{exc}")
+        if not rec_of("families", rv.get("family_id")):
+            _err(errors, "mask_rule_family_missing",
+                 f"隔离规则版本 {rv_id} 缺少模板族")
+    for fid, f in ((k[1], r) for k, r in by_key.items() if k[0] == "families"):
+        ptr = f.get("mask_active_version_id")
+        if ptr and not rec_of("mask_rule_versions", ptr):
+            if scope_kind == "family" or not declared_external(
+                    "families", fid, "mask_rule_versions", ptr):
+                _err(errors, "family_mask_pointer_dangling",
+                     f"族 {fid} 的隔离规则指针 {ptr} 既不在包内也未声明为范围边界")
+    for run_id, run in ((k[1], r) for k, r in by_key.items() if k[0] == "eval_runs"):
+        rv_id = run.get("mask_rule_version_id") or ""
+        if rv_id:
+            rv = rec_of("mask_rule_versions", rv_id)
+            if not rv:
+                _err(errors, "eval_mask_rule_missing",
+                     f"评估 {run_id} 固定的隔离规则版本 {rv_id} 不在包内且无法复核")
+            elif int(rv.get("version_no", -1)) != int(run.get("mask_rule_version_no", -2)):
+                _err(errors, "eval_mask_rule_no_mismatch",
+                     f"评估 {run_id} 固定的规则版本号与版本行不一致")
+    for req_id, req in ((k[1], r) for k, r in by_key.items() if k[0] == "requests"):
+        rv_id = req.get("mask_rule_version_id") or ""
+        rv = rec_of("mask_rule_versions", rv_id) if rv_id else None
+        if rv_id and not rv:
+            _err(errors, "request_mask_rule_missing",
+                 f"调用 {req_id} 固定的隔离规则版本 {rv_id} 不在包内且无法复核")
+        if rv and int(rv.get("version_no", -1)) != int(req.get("mask_rule_version_no", -2)):
+            _err(errors, "request_mask_rule_no_mismatch",
+                 f"调用 {req_id} 固定的规则版本号与版本行不一致（历史被改写）")
+    # 2) 遮盖映射必须与调用/规则闭合，且**密文条目可确定性自检**：用同一规则对
+    #    已存遮盖输入再跑一次识别必须 0 命中（明文已被彻底替换），每个 token 都
+    #    能在遮盖后输入中找到、密文非空且可解回非空原值（密封一致性）。
+    for hit_id, hit in ((k[1], r) for k, r in by_key.items() if k[0] == "mask_hits"):
+        req = rec_of("requests", hit.get("request_id"))
+        rv = rec_of("mask_rule_versions", hit.get("rule_version_id"))
+        if not req:
+            _err(errors, "mask_hit_request_missing",
+                 f"遮盖映射 {hit_id} 缺少调用对象")
+            continue
+        if not rv:
+            _err(errors, "mask_hit_rule_missing",
+                 f"遮盖映射 {hit_id} 的规则版本不在包内")
+            continue
+        if str(hit.get("rule_version_id")) != str(req.get("mask_rule_version_id")):
+            _err(errors, "mask_hit_rule_mismatch",
+                 f"遮盖映射 {hit_id} 的规则版本与调用固定版本不一致（历史被改写）")
+        try:
+            entries = json.loads(hit.get("entries_json", "[]"))
+            stored = json.loads(req.get("inputs_json", "{}"))
+            rules = json.loads(rv["rules_json"])
+            # 2a) 遮盖后输入再识别必须无命中（任何 pattern 都不得残留在任何字符串值中）
+            rescan = masking.apply_rules("redact", rules, stored)
+            if rescan["matched"]:
+                _err(errors, "mask_plaintext_residue",
+                     f"调用 {hit.get('request_id')} 的已存遮盖输入仍能命中规则 "
+                     f"{[x['rule_id'] for x in rescan['findings']][:3]}（明文残留）")
+            # 2b) 条目齐全、token 可在遮盖文本中定位、密文可确定性解回非空值
+            if len(entries) != int(hit.get("token_count", -1)):
+                _err(errors, "mask_token_count_mismatch",
+                     f"遮盖映射 {hit_id} 条目数与 token_count 不符")
+            blob = json.dumps(stored, ensure_ascii=False, sort_keys=True)
+            for e in entries:
+                if e.get("token") and e["token"] not in blob:
+                    _err(errors, "mask_token_missing_in_input",
+                         f"遮盖映射 {hit_id} 的 token {e['token']} 未出现在遮盖输入中")
+                try:
+                    opened = masking.open_entry(rv["rule_version_id"],
+                                                hit["request_id"], e["token"], e["ct"])
+                    if not opened:
+                        _err(errors, "mask_ciphertext_empty",
+                             f"遮盖映射 {hit_id} 存在解回为空的密文条目")
+                    elif opened in blob:
+                        _err(errors, "mask_plaintext_in_export",
+                             f"调用 {hit.get('request_id')} 的导出数据中出现明文原值"
+                             f"（密文解回值直接出现在请求存档里）")
+                except Exception as exc:  # noqa: BLE001
+                    _err(errors, "mask_ciphertext_bad",
+                         f"遮盖映射 {hit_id} 密文条目无法解封：{exc}")
+        except Exception as exc:  # noqa: BLE001
+            _err(errors, "mask_hit_fields", f"遮盖映射 {hit_id} 字段损坏：{exc}")
+    # 3) 还原凭据绝不允许出现在任何证据包内（导出文件不得携带原值还原能力）。
+    leaked_tokens = [k[1] for k in by_key if k[0] == "mask_reveal_tokens"]
+    if leaked_tokens:
+        _err(errors, "mask_reveal_token_leak",
+             f"证据包夹带了短期还原凭据（禁止导出）：{leaked_tokens[:3]}")
+
     # —— 窄范围选择集合精确性（防夹带）——
     # version 范围：包内版本必须恰好是勾选版本；灰度批次与风控四表必须为空；
     # 包内调用必须全部命中勾选版本。requests 范围：包内调用必须恰好是勾选集合，
@@ -1291,6 +1435,26 @@ class PackView:
             if r["request_id"] == request_id:
                 return r
         return None
+
+    # ------------------------------------------------ 敏感内容隔离（只读历史）
+    def mask_rule(self, rule_version_id: str) -> dict | None:
+        return self._get("mask_rule_versions", rule_version_id)
+
+    def mask_hit(self, request_id: str) -> dict | None:
+        for r in self.by_table["mask_hits"]:
+            if str(r.get("request_id")) == str(request_id):
+                d = dict(r)
+                try:
+                    d["entries"] = json.loads(r.get("entries_json", "[]"))
+                except Exception:  # noqa: BLE001
+                    d["entries"] = []
+                return d
+        return None
+
+    def mask_rules_for_family(self, family_id: str) -> list[dict]:
+        return sorted((r for r in self.by_table["mask_rule_versions"]
+                       if r["family_id"] == family_id),
+                      key=lambda r: -int(r["version_no"]))
 
     def stoploss_overview(self, rollout_id: str) -> dict:
         ro = self.rollout(rollout_id)

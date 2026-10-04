@@ -50,6 +50,24 @@ TEST_CASES = [
 # 演示用输入
 ONLINE_INPUTS = {"customer_text": "客服非常耐心，问题一次解决", "lang": "zh", "channel": "app"}
 
+# 敏感内容隔离演示：含手机号/邮箱的客户文本（redact 规则替换后才进入模板渲染）
+SENSITIVE_INPUTS = {"customer_text": "我的手机号 13800001111 和邮箱 a@b.com 请保密，服务很满意点赞",
+                    "lang": "zh", "channel": "app"}
+# 命中 deny 策略的输入（阻断，不接触模型）
+FORBIDDEN_INPUTS = {"customer_text": "身份证号 110101199001011234 泄露，要求处理",
+                    "lang": "zh", "channel": "web"}
+
+MASK_RULES_V1 = [
+    {"rule_id": "phone", "field": "customer_text", "match": "literal",
+     "pattern": "13800001111", "replacement": "[手机号]"},
+    {"rule_id": "email", "field": "*", "match": "literal",
+     "pattern": "a@b.com", "replacement": "[邮箱]"},
+]
+MASK_RULES_V2_DENY = [
+    {"rule_id": "idcard", "field": "customer_text", "match": "literal",
+     "pattern": "110101199001011234", "replacement": "[身份证号]"},
+]
+
 
 def run() -> None:
     conn = get_conn()
@@ -133,7 +151,32 @@ def run() -> None:
         services.report_feedback(ro["rollout_id"], f"seed-demo-fb-{idx:02d}",
                                  res["request_id"], outcome, actor)
 
+    # 敏感内容隔离演示：
+    # 1) 授权复核人名册（只有 sec-oncall 能申请/消费短期还原凭据）；
+    # 2) 发布 v1 替换规则（手机号/邮箱），产生一条 redact 线上请求（原值密文）；
+    # 3) 再发布 v2 阻断规则（身份证号），产生一条 deny 请求（未接触模型）；
+    #    v1 规则下的历史请求仍固定 v1，演示"规则更新不改写在途/历史请求"。
+    from . import mask_service
+    mask_service.add_reviewer(FAMILY, "sec-oncall", actor, "值班安全复核人")
+    mask_service.create_rule_version(
+        FAMILY, "redact", MASK_RULES_V1, actor,
+        "默认：客户文本中的手机号/邮箱遮盖后再渲染", activate=True)
+    red = services.invoke(FAMILY, SENSITIVE_INPUTS, actor,
+                          request_id="seed-mask-redact-01")
+    mask_service.create_rule_version(
+        FAMILY, "deny", MASK_RULES_V2_DENY, actor,
+        "身份证号出现即阻断（不接触模型）", activate=True)
+    services.invoke(FAMILY, FORBIDDEN_INPUTS, actor, request_id="seed-mask-deny-01")
+    # 切回 v1 redact 作为默认生效策略；v2 deny 保留可一键切回。
+    versions = mask_service.list_rule_versions(FAMILY)
+    v1_rule = next(v for v in versions if v["version_no"] == 1)
+    mask_service.activate_rule_version(v1_rule["rule_version_id"], actor)
+
     conn.commit()
+    print("[seed] 敏感隔离已就绪：sec-oncall 授权复核；规则 v1 redact（手机/邮箱，"
+          "请求 seed-mask-redact-01）→ v2 deny（身份证，请求 seed-mask-deny-01），"
+          "已切回 v1；原值仅密文，还原走绑定请求的单次短期凭据"
+          "（/families/%s/mask）。" % FAMILY)
     print("[seed] 演示数据就绪：family=%s 线上=v1，候选 v2（20%% 放量中，止损 3600s/"
           "n≥10/失败≤30%%，已入账 8 成功 2 失败）、v3（需工具权限审批）、"
           "v4（弱模型证据）" % FAMILY)

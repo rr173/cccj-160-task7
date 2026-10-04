@@ -8,7 +8,10 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from . import config, core, llm
+from . import masking
+from . import mask_service
 from .db import audit, get_conn, write_tx
+from .errors import Conflict, DomainError, NotFound  # re-export（app/evidence 沿用）
 
 
 def _uid(prefix: str) -> str:
@@ -88,18 +91,6 @@ def _family_row(family_id: str):
     if not row:
         raise NotFound(f"模板族不存在: {family_id}")
     return row
-
-
-class DomainError(Exception):
-    """400 级业务错误。"""
-
-
-class NotFound(DomainError):
-    """404。"""
-
-
-class Conflict(DomainError):
-    """409：并发冲突 / 状态不允许。"""
 
 
 # ================================================================ 模板族 / 版本
@@ -276,14 +267,22 @@ def start_evaluation(version_id: str, actor: str) -> str:
         (testset["testset_id"],)).fetchall()
 
     with write_tx() as c:
+        # 评估同样固定当时的隔离规则版本：评估回放与线上请求共用确定的规则版本，
+        # 评估运行期间规则再发布不影响本次证据（与在途请求同一语义）。
+        mask_rule = mask_service.pin_active(c, v["family_id"])
         c.execute(
-            """INSERT INTO eval_runs(run_id,version_id,testset_id,model_id,status,total)
-               VALUES (?,?,?,?, 'running', ?)""",
-            (run_id, version_id, testset["testset_id"], use_model, len(cases)))
+            """INSERT INTO eval_runs(run_id,version_id,testset_id,model_id,status,total,
+               mask_rule_version_no,mask_rule_version_id)
+               VALUES (?,?,?,?, 'running', ?,?,?)""",
+            (run_id, version_id, testset["testset_id"], use_model, len(cases),
+             int(mask_rule["version_no"]) if mask_rule else 0,
+             mask_rule["rule_version_id"] if mask_rule else ""))
         c.execute("UPDATE versions SET status='evaluating' WHERE version_id=? "
                   "AND status IN ('draft','failed_eval','evaluated')", (version_id,))
         audit(actor, "eval.start", "eval_run", run_id,
-              f"version={version_id} model={use_model} cases={len(cases)}")
+              f"version={version_id} model={use_model} cases={len(cases)}"
+              + (f" mask=v{mask_rule['version_no']}:{mask_rule['action']}"
+                 if mask_rule else " mask=off"))
     return run_id
 
 
@@ -302,6 +301,13 @@ def run_evaluation(run_id: str, actor: str = "evaluator") -> dict:
     v = _version_row(run["version_id"])
     contract = _loads(v["variable_contract"])
     params = _loads(v["model_params"])
+    # 评估固定的隔离规则版本（不读当前指针——规则更新不改写本次证据）
+    mask_rule = None
+    if run["mask_rule_version_id"]:
+        mr = get_conn().execute(
+            "SELECT * FROM mask_rule_versions WHERE rule_version_id=?",
+            (run["mask_rule_version_id"],)).fetchone()
+        mask_rule = mask_service._rule_view(mr) if mr else None
 
     cases = get_conn().execute(
         "SELECT * FROM testcases WHERE testset_id=? ORDER BY seq",
@@ -311,9 +317,16 @@ def run_evaluation(run_id: str, actor: str = "evaluator") -> dict:
     for case in cases:
         raw_inputs = _loads(case["inputs"])
         inputs = core.project_inputs(raw_inputs, contract)
-        inp_digest = core.digest_inputs(inputs)
-        prompt = core.render_prompt(v["system_instruction"], contract, raw_inputs)
-        output = llm.generate(run["model_id"], v["content_hash"], prompt, inputs, params)
+        iso = mask_service.isolate(mask_rule, inputs, f"eval:{run['run_id']}:{case['case_id']}")
+        effective = iso["effective"]
+        inp_digest = core.digest_inputs(effective)
+        if iso["deny"]:
+            # 阻断策略：该用例不接触模型；渲染提示留空、输出为固定拒绝答复。
+            prompt = ""
+            output = masking.DENY_OUTPUT
+        else:
+            prompt = render_prompt_with_inputs(v["system_instruction"], contract, effective)
+            output = llm.generate(run["model_id"], v["content_hash"], prompt, effective, params)
         ok, detail = llm.assert_expect(output, _loads(case["expect"]))
         passed += int(ok)
         detail_rows.append((case["case_id"], case["seq"], case["name"], inp_digest,
@@ -1427,10 +1440,51 @@ def stoploss_overview(rollout_id: str) -> dict:
 
 # ================================================================ 线上调用
 
+def render_prompt_with_inputs(system_instruction: str, contract: dict,
+                              projected_inputs: dict) -> str:
+    """用**已经过契约投影/隔离遮盖**的输入直接渲染（不再投影、不再校验）。"""
+    from .jinja_compat import render_text
+    return render_text(system_instruction, projected_inputs)
+
+
+def _stored_request_view(row) -> dict:
+    """重复推理幂等返回：直接按已落库行重建响应（**不重新推理、不重新隔离**）。
+
+    规则随后更新时，返回的仍是请求首次发生时固定版本下的同一遮盖结果。
+    """
+    inputs = _loads(row["inputs_json"])
+    params = _loads(row["params_json"]) if row["params_json"] else {}
+    return {
+        "request_id": row["request_id"], "family_id": row["family_id"],
+        "version_id": row["version_id"], "model_id": row["model_id"],
+        "input_digest": row["input_digest"], "template_hash": row["template_hash_at_call"],
+        "output_digest": row["output_digest"],
+        "rendered_prompt": row["rendered_prompt"], "output": _loads(row["output"]),
+        "routing_key": row["routing_key"], "rollout_id": row["rollout_id"],
+        "rollout_generation": row["rollout_generation"],
+        "params_fingerprint": row["params_fingerprint"],
+        "authz_snapshot": _loads(row["authz_snapshot_json"]) if row["authz_snapshot_json"]
+        else {"required": False},
+        "mask_rule_version_no": row["mask_rule_version_no"],
+        "mask_rule_version_id": row["mask_rule_version_id"],
+        "mask_action": row["mask_action"],
+        "masked": bool(row["mask_action"]),
+        "blocked": row["mask_action"] == "deny",
+        "idempotent": True,
+        "params": params,
+    }
+
+
 def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = None,
            routing_key: str | None = None) -> dict:
-    """线上推理：路由决策 + 精确三元组固化。
+    """线上推理：敏感内容隔离 + 路由决策 + 精确三元组固化。
 
+    隔离先于路由后的一切处理：
+    - 族上存在生效隔离规则时，在首个写锁事务内**固定规则版本**，规则在推理
+      期间更新也不改写本请求（落库事务不重读规则指针）；
+    - redact：遮盖后的输入参与契约投影后的模板渲染与模型推理；
+    - deny：命中即返回固定拒绝答复，**不接触模型**，库里只存遮盖后输入与密文映射；
+    - 同一 request_id 重复推理：直接返回首次的同一遮盖结果（幂等，不产生新行）。
     - 无进行中批次：只消费当前线上版本（原有一步切换语义不变）；
     - 批次放量中且携带 routing_key：稳定散列分桶，bucket < weight 走候选构件，
       否则走当前构件；同一代次内同一 key 的决定不漂移；
@@ -1442,8 +1496,18 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
       之后到期或撤销改写结论。
     """
     routing_key = (routing_key or "").strip() or None
+    rid = (request_id or "").strip() or None
+    # 幂等优先：同一 request_id 直接返回首次结果（重复推理返回同一遮盖结果）。
+    if rid:
+        prev = get_conn().execute("SELECT * FROM requests WHERE request_id=?",
+                                  (rid,)).fetchone()
+        if prev:
+            audit(actor, "invoke.duplicate", "request", rid,
+                  f"family={family_id} 重复推理幂等返回首次遮盖结果 "
+                  f"mask_v={prev['mask_rule_version_no']} mask_action={prev['mask_action']}")
+            return _stored_request_view(prev)
     authz_snapshot = {"required": False}
-    with write_tx() as c:  # 立即取锁，保证读到的指针/批次与版本快照一致
+    with write_tx() as c:  # 立即取锁，保证读到的指针/批次/规则版本相互一致
         family = c.execute("SELECT * FROM families WHERE family_id=?", (family_id,)).fetchone()
         if not family:
             raise NotFound(f"模板族不存在: {family_id}")
@@ -1501,23 +1565,45 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
         model_id = params.get("_bound_model")
         if not model_id:
             raise DomainError("命中版本缺少绑定模型标识（数据异常）")
+        # 固定敏感内容隔离规则版本（在途请求不受随后规则发布影响）。
+        mask_rule = mask_service.pin_active(c, family_id)
 
     errors = core.validate_against_contract(inputs, contract)
     if errors:
         raise DomainError("输入违反变量契约: " + "; ".join(errors))
-    effective = core.project_inputs(inputs, contract)
-    prompt = core.render_prompt(v["system_instruction"], contract, inputs)
-    output = llm.generate(model_id, v["content_hash"], prompt, effective, params)
+    projected = core.project_inputs(inputs, contract)
+    iso = mask_service.isolate(mask_rule, projected, rid or "(pending)")
+    effective = iso["effective"]
+    mask_action = ""
+    output = None
+    if iso["deny"]:
+        # 阻断：不渲染、不推理；库里同样不留明文（存遮盖版输入与密文映射）。
+        mask_action = "deny"
+        effective = iso["storage_inputs"]
+        prompt = ""
+        output = masking.DENY_OUTPUT
+    else:
+        prompt = render_prompt_with_inputs(v["system_instruction"], contract, effective)
+        output = llm.generate(model_id, v["content_hash"], prompt, effective, params)
+        if iso["matched"]:
+            mask_action = "redact"
     inp_digest = core.digest_inputs(effective)
     out_digest = core.digest_output(output)
     params_json = json.dumps(params, sort_keys=True, ensure_ascii=False)
     params_fp = core.params_fingerprint(params)
-    rid = request_id or _uid("req")
+    rid = rid or _uid("req")
+    # 密文条目绑定的 request_id 需要最终 rid：阻断/替换发生在 rid 生成前时重封一次。
+    if iso["matched"] and iso["entries"]:
+        iso = mask_service.isolate(mask_rule, projected, rid)
+        effective = iso["storage_inputs"]
+        inp_digest = core.digest_inputs(effective)
 
     with write_tx() as c:
         # 插入前在同一写锁事务内按"请求落库时刻"再确认一次授权（路由决策与本行
         # 写入之间隔着一次推理，期间授权可能恰好到期/被撤销）；任一失败本行不写，
         # 线上指针与放量状态也不变。最终快照以本次复核为准固化。
+        # 注意：隔离规则**故意不在此重读**——本请求固定路由事务时的版本，规则
+        # 更新不能改写在途请求。
         if hit_rollout_id and authz_snapshot.get("required"):
             ro2 = c.execute("SELECT * FROM rollouts WHERE rollout_id=?",
                             (hit_rollout_id,)).fetchone()
@@ -1546,23 +1632,29 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
                 "state_at_check": a["state"],
             }
         snapshot_json = json.dumps(authz_snapshot, ensure_ascii=False, sort_keys=True)
+        mask_vid = mask_rule["rule_version_id"] if mask_rule else ""
+        mask_vno = int(mask_rule["version_no"]) if mask_rule else 0
         c.execute(
             """INSERT INTO requests(request_id,family_id,version_id,model_id,input_digest,
                inputs_json,rendered_prompt,output_digest,output,template_hash_at_call,
                routing_key,rollout_id,rollout_generation,params_json,params_fingerprint,
-               authz_snapshot_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               authz_snapshot_json,mask_rule_version_no,mask_rule_version_id,mask_action)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (rid, family_id, hit_version_id, model_id, inp_digest,
              json.dumps(effective, ensure_ascii=False, sort_keys=True), prompt,
              out_digest, output, v["content_hash"], routing_key, hit_rollout_id,
-             hit_generation, params_json, params_fp, snapshot_json))
-        audit(actor, "invoke", "request", rid,
+             hit_generation, params_json, params_fp, snapshot_json,
+             mask_vno, mask_vid, mask_action))
+        mask_service.persist_hit(c, rid, family_id, iso)
+        audit(actor, "invoke" if mask_action != "deny" else "invoke.deny", "request", rid,
               f"family={family_id} version={hit_version_id} model={model_id} "
               f"input={inp_digest[:12]} output={out_digest[:12]}"
               + (f" rollout={hit_rollout_id}@gen{hit_generation} key={routing_key}"
                  if hit_rollout_id else "")
               + (" authz=" + authz_snapshot.get("approval_id", "none")
-                 if authz_snapshot.get("required") else ""))
+                 if authz_snapshot.get("required") else "")
+              + (f" mask=v{mask_vno}:{mask_action} tokens={len(iso['entries'])}"
+                 if mask_rule else ""))
     return {
         "request_id": rid, "family_id": family_id, "version_id": hit_version_id,
         "model_id": model_id, "input_digest": inp_digest, "template_hash": v["content_hash"],
@@ -1570,6 +1662,9 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
         "routing_key": routing_key, "rollout_id": hit_rollout_id,
         "rollout_generation": hit_generation, "params_fingerprint": params_fp,
         "authz_snapshot": authz_snapshot,
+        "mask_rule_version_no": mask_vno, "mask_rule_version_id": mask_vid,
+        "mask_action": mask_action, "masked": bool(mask_action),
+        "blocked": mask_action == "deny", "idempotent": False,
     }
 
 
@@ -1636,7 +1731,24 @@ def replay(request_id: str, actor: str, override_version_id: str | None = None,
     if errors:
         raise DomainError("重演输入违反目标版本变量契约: " + "; ".join(errors))
     effective = core.project_inputs(use_inputs, contract)
-    prompt = core.render_prompt(v["system_instruction"], contract, use_inputs)
+    # 证据复核共用请求**固定的规则版本**：精确重演直接复用已遮盖输入；反事实
+    # 提交的新输入同样按该版本隔离（规则再发布不影响历史请求的复查口径）。
+    # 无隔离旧请求（mask_rule_version_id 为空）按原样处理。
+    mask_rule = mask_service.pinned_rule_for_request(req)
+    if override_inputs is not None and mask_rule:
+        iso = mask_service.isolate(mask_rule, effective, f"replay:{request_id}")
+        effective = iso["storage_inputs"] if iso["matched"] else effective
+        if iso["deny"]:
+            prompt = ""
+            output = masking.DENY_OUTPUT
+            new_in_digest = core.digest_inputs(effective)
+            new_out_digest = core.digest_output(output)
+            return _finish_replay(
+                request_id, override_version_id, override_model_id,
+                override_inputs is not None, prompt, output, effective,
+                req, v, use_version_id, use_model_id, new_in_digest,
+                new_out_digest, actor)
+    prompt = render_prompt_with_inputs(v["system_instruction"], contract, effective)
     output = llm.generate(use_model_id, v["content_hash"], prompt, effective, params)
     if inject_drift:
         # 模拟同三元组下的运行时漂移（真实模型温度/后端差异）
@@ -1646,6 +1758,17 @@ def replay(request_id: str, actor: str, override_version_id: str | None = None,
 
     new_in_digest = core.digest_inputs(effective)
     new_out_digest = core.digest_output(output)
+    return _finish_replay(
+        request_id, override_version_id, override_model_id,
+        override_inputs is not None, prompt, output, effective,
+        req, v, use_version_id, use_model_id, new_in_digest, new_out_digest, actor)
+
+
+def _finish_replay(request_id, override_version_id, override_model_id,
+                   has_override_inputs, prompt, output, effective,
+                   req, v, use_version_id, use_model_id, new_in_digest,
+                   new_out_digest, actor):
+    """重演比较、落库与响应构造（exact 与隔离 deny 反事实共用）。"""
     same_template = v["content_hash"] == req["template_hash_at_call"]
     same_model = use_model_id == req["model_id"]
     same_input = new_in_digest == req["input_digest"]
@@ -1659,7 +1782,7 @@ def replay(request_id: str, actor: str, override_version_id: str | None = None,
     if not same_input:
         changed_axes.append("input")
     mode = "exact" if not changed_axes and not override_version_id and \
-        not override_model_id and override_inputs is None else "counterfactual"
+        not override_model_id and not has_override_inputs else "counterfactual"
 
     if same_template and same_model and same_input and same_output:
         verdict = "reproduced"
@@ -1679,7 +1802,7 @@ def replay(request_id: str, actor: str, override_version_id: str | None = None,
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (replay_id, request_id, mode, ",".join(changed_axes) or "none",
              override_version_id, use_model_id if override_model_id else None,
-             new_in_digest if override_inputs is not None else None, verdict,
+             new_in_digest if has_override_inputs else None, verdict,
              int(same_template), int(same_model), int(same_input), int(same_output),
              new_out_digest, output))
         audit(actor, "replay", "replay", replay_id,

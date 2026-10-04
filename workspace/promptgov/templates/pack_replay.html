@@ -12,9 +12,41 @@
   产生时间 {{ req.created_at }}。
 </div>
 
-{% if authz %}
+{% if pack_mask %}
 <div class="card">
-  <h2>工具扩权授权快照（命中时固化，归档内复核）</h2>
+  <h2>敏感内容隔离历史（归档内复核）
+    <span class="chip">固定规则版本 v{{ pack_mask.rule_version_no }}</span></h2>
+  <div class="kv">
+    <div>规则版本</div><div class="mono small">{{ pack_mask.rule_version_id }}
+      {% if pack_mask.rule_in_pack %}<span class="chip ok">规则定义在包内</span>
+      {% else %}<span class="chip warn">规则定义在范围边界（external_ref）</span>{% endif %}
+      <div class="small">指纹 <span class="mono">{{ pack_mask.rules_hash }}</span></div></div>
+    <div>处置动作</div><div>
+      {% if pack_mask.action == 'deny' %}<span class="badge b-failed_eval">deny 阻断</span>
+      {% elif pack_mask.action == 'redact' %}<span class="badge b-active">redact 替换</span>
+      {% else %}{{ pack_mask.action }}{% endif %}</div>
+    <div>命中规则</div><div>{% for r in pack_mask.rules %}<span class="chip">{{ r.rule_id }}</span>
+      {% endfor %}{% if not pack_mask.rules %}<span class="small mut">规则定义在包外</span>{% endif %}</div>
+    <div>遮盖映射</div><div>{{ pack_mask.entries|length }} 条密文条目
+      （归档不含还原凭据，无法在包外还原原值）</div>
+  </div>
+  {% if pack_mask.entries %}
+  <table style="margin-top:8px">
+    <thead><tr><th>字段</th><th>规则</th><th>token</th><th>替换形态</th></tr></thead>
+    <tbody>
+    {% for e in pack_mask.entries %}
+      <tr><td class="small">{{ e.field }}</td><td class="small">{{ e.rule_id }}</td>
+        <td class="mono small">{{ e.token }}</td><td class="small">{{ e.replacement }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  <p class="small mut">包内存档的输入/提示为遮盖后内容；导入校验会重跑规则确认
+    无明文残留、密文可解封一致、固定版本号未被改写。</p>
+</div>
+{% endif %}
+
+{% if authz.exists %}
   {% if authz.required %}
   <div class="kv">
     <div>命中时状态</div><div><span class="badge b-{{ authz.state_at_check }}">

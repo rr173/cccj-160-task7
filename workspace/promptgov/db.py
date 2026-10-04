@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS families (
     name             TEXT NOT NULL,
     description      TEXT NOT NULL DEFAULT '',
     active_version_id TEXT,                 -- 当前线上唯一指针，NULL=未发布
+    -- 当前生效的敏感内容隔离规则版本行 id（NULL=未配置隔离，线上输入原样渲染）。
+    -- 翻转只影响之后的新请求；每个请求固化当时的规则版本号，规则更新不改写历史。
+    mask_active_version_id TEXT,
     updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -92,6 +95,10 @@ CREATE TABLE IF NOT EXISTS eval_runs (
     total            INTEGER NOT NULL DEFAULT 0,
     passed           INTEGER NOT NULL DEFAULT 0,
     late             INTEGER NOT NULL DEFAULT 0,  -- 提交时版本是否已离开 evaluated 候选态
+    -- 评估开始时固定的敏感内容隔离规则版本（与线上请求同一套版本化规则）；
+    -- 0/''=评估时族未启用隔离。评估运行期间规则再发布不影响本次证据。
+    mask_rule_version_no INTEGER NOT NULL DEFAULT 0,
+    mask_rule_version_id TEXT NOT NULL DEFAULT '',
     note             TEXT NOT NULL DEFAULT '',
     created_at       TEXT NOT NULL DEFAULT (datetime('now')),
     finished_at      TEXT
@@ -131,6 +138,11 @@ CREATE TABLE IF NOT EXISTS requests (
     -- 结论/覆盖工具/有效期/撤销状态/复查时刻）。之后复查只按本快照，不随后续
     -- 到期或撤销改写结论；NULL = 该命中未走权限扩大复核（基线/未扩大候选/旧调用）。
     authz_snapshot_json TEXT NOT NULL DEFAULT '',
+    -- 敏感内容隔离：请求固定的规则版本（版本号+行 id）与实际处置（''/redact/deny）。
+    -- 规则随后再发布不改写在途/历史请求；0/''=隔离功能上线前的旧调用。
+    mask_rule_version_no INTEGER NOT NULL DEFAULT 0,
+    mask_rule_version_id TEXT NOT NULL DEFAULT '',
+    mask_action      TEXT NOT NULL DEFAULT '',
     created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -297,6 +309,83 @@ CREATE TABLE IF NOT EXISTS evidence_audit (
     created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- ============================================================ 敏感内容隔离
+-- 规则按模板族配置、版本化且不可变：每次"发布新版本"产生新行，族上唯一指针
+-- families.mask_active_version 指向当前生效版本。线上请求在写锁事务内**固定**
+-- 当时的规则版本（rule_version_no 固化进 requests），随后规则再发布也不能
+-- 改写在途/历史请求——重放隔离永远按请求固化的版本号执行。
+CREATE TABLE IF NOT EXISTS mask_rule_versions (
+    rule_version_id  TEXT PRIMARY KEY,
+    family_id        TEXT NOT NULL REFERENCES families(family_id),
+    version_no       INTEGER NOT NULL,       -- 族内单调递增（1,2,3...）
+    status           TEXT NOT NULL DEFAULT 'draft',  -- draft / active / retired
+    action           TEXT NOT NULL DEFAULT 'redact', -- redact（替换）/ deny（拒绝）
+    -- 规则集规范化 JSON：[{"rule_id","field","match","pattern","replacement"}]。
+    -- field=* 表示任意变量字符串值；pattern 为字面量子串（演示用确定性识别）。
+    rules_json       TEXT NOT NULL,
+    rules_hash       TEXT NOT NULL,          -- rules_json+action 的规范化 SHA-256
+    note             TEXT NOT NULL DEFAULT '',
+    created_by       TEXT NOT NULL DEFAULT 'api',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    activated_at     TEXT,
+    retired_at       TEXT,
+    UNIQUE(family_id, version_no)
+);
+
+-- 逐请求遮盖映射：只存**密文**（零依赖演示加密：sha256 派生密钥流 XOR +
+-- base64；生产可替换为 KMS 信封加密，存储/接口不变）。明文绝不进数据库、
+-- 审计与导出文件。一个 request_id 一行（UNIQUE）：重复推理返回同一遮盖
+-- 结果时直接复用本行；还原凭据一次性消费，重复还原不再暴露原值。
+CREATE TABLE IF NOT EXISTS mask_hits (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id       TEXT NOT NULL UNIQUE,
+    family_id        TEXT NOT NULL,
+    rule_version_id  TEXT NOT NULL,
+    rule_version_no  INTEGER NOT NULL,       -- 请求固定的规则版本（不受后续发布影响）
+    action           TEXT NOT NULL,          -- 该请求实际执行的动作 redact/deny
+    token_count      INTEGER NOT NULL DEFAULT 0,
+    -- 密文条目 JSON：[{"token":⟨遮盖标记⟩,"field","rule_id","ct":⟨base64 密文⟩}]。
+    -- 同一请求内同一原值复用同一 token（确定性遮盖）；密文只在此列出现一次。
+    entries_json     TEXT NOT NULL DEFAULT '[]',
+    masked_digest    TEXT NOT NULL DEFAULT '', -- 遮盖后输入摘要（实际渲染/推理的那一版）
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 短期还原凭据：绑定单个请求、单次消费。凭据只以 SHA-256 哈希存储（数据库泄露
+-- 也无法反推凭据）；消费以行守卫 UPDATE ... WHERE consumed_at IS NULL 保证
+-- 并发/重复还原恰好一次成功。过期（半开区间：t >= expires_at 即失效）、未授权
+-- 复核人、绑定别的请求都拒绝，且只写审计。
+CREATE TABLE IF NOT EXISTS mask_reveal_tokens (
+    token_id         TEXT PRIMARY KEY,
+    request_id       TEXT NOT NULL,
+    family_id        TEXT NOT NULL,
+    reviewer         TEXT NOT NULL,          -- 获授权的复核人（凭据绑定身份）
+    token_sha        TEXT NOT NULL UNIQUE,    -- 明文凭据只在创建响应中出现一次
+    status           TEXT NOT NULL DEFAULT 'issued', -- issued / consumed / revoked
+    ttl_seconds      INTEGER NOT NULL,
+    expires_at       TEXT NOT NULL,          -- 半开区间：created ≤ t < expires 有效
+    consumed_at      TEXT,
+    consumed_by      TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_mask_versions_family ON mask_rule_versions(family_id);
+CREATE INDEX IF NOT EXISTS idx_mask_hits_family ON mask_hits(family_id);
+CREATE INDEX IF NOT EXISTS idx_mask_tokens_request ON mask_reveal_tokens(request_id);
+CREATE INDEX IF NOT EXISTS idx_mask_tokens_sha ON mask_reveal_tokens(token_sha);
+
+-- 获授权的原值复核人名册（按模板族）：只有名册内复核人能为该族请求申请/使用
+-- 短期还原凭据。管理员维护，所有变更写审计；凭据本身仍绑定请求且单次消费。
+CREATE TABLE IF NOT EXISTS mask_reviewers (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    family_id        TEXT NOT NULL REFERENCES families(family_id),
+    reviewer         TEXT NOT NULL,
+    note             TEXT NOT NULL DEFAULT '',
+    active           INTEGER NOT NULL DEFAULT 1,
+    created_by       TEXT NOT NULL DEFAULT 'admin',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(family_id, reviewer)
+);
+
 CREATE INDEX IF NOT EXISTS idx_versions_family ON versions(family_id);
 CREATE INDEX IF NOT EXISTS idx_eval_version ON eval_runs(version_id);
 CREATE INDEX IF NOT EXISTS idx_requests_version ON requests(version_id);
@@ -318,6 +407,15 @@ _REQUESTS_NEW_COLUMNS = {
         "ALTER TABLE requests ADD COLUMN params_fingerprint TEXT NOT NULL DEFAULT ''",
     "authz_snapshot_json":
         "ALTER TABLE requests ADD COLUMN authz_snapshot_json TEXT NOT NULL DEFAULT ''",
+    # 敏感内容隔离：请求固定的规则版本号/规则版本行 id 与处置结果。
+    # 0/'' = 隔离上线前的旧调用（复查时按"无隔离"兼容）；deny 的请求输出为
+    # 固定拒绝答复，不接触模型。规则再发布不改写本列，在途/历史请求永远按此复查。
+    "mask_rule_version_no":
+        "ALTER TABLE requests ADD COLUMN mask_rule_version_no INTEGER NOT NULL DEFAULT 0",
+    "mask_rule_version_id":
+        "ALTER TABLE requests ADD COLUMN mask_rule_version_id TEXT NOT NULL DEFAULT ''",
+    "mask_action":
+        "ALTER TABLE requests ADD COLUMN mask_action TEXT NOT NULL DEFAULT ''",
 }
 
 # 老库增量迁移：rollouts 的自动止损标记列
@@ -334,6 +432,20 @@ _APPROVALS_NEW_COLUMNS = {
     "revoked_at": "ALTER TABLE approvals ADD COLUMN revoked_at TEXT",
     "revoked_by": "ALTER TABLE approvals ADD COLUMN revoked_by TEXT NOT NULL DEFAULT ''",
     "revoke_reason": "ALTER TABLE approvals ADD COLUMN revoke_reason TEXT NOT NULL DEFAULT ''",
+}
+
+# 老库增量迁移：families 的隔离规则当前版本指针（NULL=未配置隔离）
+_FAMILIES_NEW_COLUMNS = {
+    "mask_active_version_id":
+        "ALTER TABLE families ADD COLUMN mask_active_version_id TEXT",
+}
+
+# 老库增量迁移：eval_runs 的隔离规则固定列
+_EVAL_RUNS_NEW_COLUMNS = {
+    "mask_rule_version_no":
+        "ALTER TABLE eval_runs ADD COLUMN mask_rule_version_no INTEGER NOT NULL DEFAULT 0",
+    "mask_rule_version_id":
+        "ALTER TABLE eval_runs ADD COLUMN mask_rule_version_id TEXT NOT NULL DEFAULT ''",
 }
 
 _lock = threading.Lock()
@@ -365,6 +477,14 @@ def init_db() -> None:
             acols = {r["name"] for r in conn.execute("PRAGMA table_info(approvals)")}
             for col, ddl in _APPROVALS_NEW_COLUMNS.items():
                 if col not in acols:
+                    conn.execute(ddl)
+            fcols = {r["name"] for r in conn.execute("PRAGMA table_info(families)")}
+            for col, ddl in _FAMILIES_NEW_COLUMNS.items():
+                if col not in fcols:
+                    conn.execute(ddl)
+            ecols = {r["name"] for r in conn.execute("PRAGMA table_info(eval_runs)")}
+            for col, ddl in _EVAL_RUNS_NEW_COLUMNS.items():
+                if col not in ecols:
                     conn.execute(ddl)
             conn.commit()
         finally:

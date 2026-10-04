@@ -1,0 +1,25 @@
+<div class="flash" style="background:rgba(232,168,56,.12);border:1px solid rgba(232,168,56,.4);color:#ffd98a">
+  🔓 原值仅在本页展示<b>这一次</b>。凭据 <span class="mono">{{ token_id }}</span> 已消费
+  （{{ consumed_at }}，复核人 {{ reviewer }}）。刷新、回退、分享链接或再次提交同一凭据
+  都不会再显示原值。本页响应带 no-store，请按需记录后立即关闭。
+</div>
+
+<div class="card">
+  <h2>还原结果 · 请求 <span class="mono">{{ req.request_id }}</span></h2>
+  <p class="small">{{ req.family_name }} · {{ req.created_at }}</p>
+  <table>
+    <thead><tr><th>字段</th><th>命中规则</th><th>遮盖标记</th><th>原值（一次性）</th></tr></thead>
+    <tbody>
+    {% for v in values %}
+      <tr><td class="small">{{ v.field }}</td>
+        <td class="small"><span class="chip">{{ v.rule_id }}</span></td>
+        <td class="mono small">{{ v.token }}</td>
+        <td class="small" style="color:var(--warn)"><b>{{ v.value }}</b></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <div class="row" style="margin-top:12px">
+    <a class="btn ghost" href="/requests/{{ req.request_id }}/review">返回请求复核页</a>
+    <a class="btn ghost" href="/requests/{{ req.request_id }}/replay">前往重演复核</a>
+  </div>
+</div>

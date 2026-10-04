@@ -1,0 +1,137 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/families/{{ req.family_id }}">← {{ req.family_name }}</a> ·
+  <a href="{{ replay_href }}">调用重演复核页 →</a><br>
+  本页只展示<b>遮盖后内容</b>与密文映射的元数据（字段/规则/token），不含原值。
+  原值还原需授权复核人使用<b>绑定本请求、短期、单次消费</b>的凭据；重复或过期凭据
+  不会再次暴露原值，全部尝试逐请求留痕。
+</div>
+
+<div class="grid g2">
+  <div class="card">
+    <h2>请求隔离状态</h2>
+    <div class="kv">
+      <div>request_id</div><div class="mono">{{ req.request_id }}</div>
+      <div>时间</div><div>{{ req.created_at }}</div>
+      <div>命中构件</div><div class="mono">{{ req.version_id }}</div>
+      <div>固定规则版本</div><div>
+        {% if has_mask %}<span class="chip">v{{ mask.rule_version_no }}</span>
+          <span class="mono small">{{ mask.rule_version_id }}</span>
+          {% if not mask.rule_version_in_pack %}<span class="chip warn">规则版本不在当前库（证据包边界/旧库）</span>{% endif %}
+        {% else %}<span class="mut">无隔离（隔离上线前的旧请求）</span>{% endif %}</div>
+      <div>处置动作</div><div>
+        {% if req.mask_action == 'deny' %}<span class="badge b-failed_eval">deny 已阻断（未接触模型）</span>
+        {% elif req.mask_action == 'redact' %}<span class="badge b-active">redact 已替换</span>
+        {% else %}<span class="mut">未命中 / 无隔离</span>{% endif %}</div>
+      <div>遮盖条目</div><div>{{ entries|length }} 条（密文存储）</div>
+    </div>
+
+    <h3>遮盖后输入（参与模板渲染的版本）</h3>
+    <pre>{{ req.inputs_json | e }}</pre>
+    <h3>渲染提示 / 输出</h3>
+    {% if req.rendered_prompt %}<pre>{{ req.rendered_prompt | e }}</pre>
+    {% else %}<p class="small warn">deny 阻断：未生成渲染提示。</p>{% endif %}
+    <pre>{{ req.output | e }}</pre>
+  </div>
+
+  <div class="card">
+    <h2>逐请求遮盖映射（密文）</h2>
+    {% if entries %}
+    <table>
+      <thead><tr><th>字段</th><th>规则</th><th>遮盖标记</th><th>替换后形态</th></tr></thead>
+      <tbody>
+      {% for e in entries %}
+        <tr><td class="small">{{ e.field }}</td>
+          <td class="small"><span class="chip">{{ e.rule_id }}</span></td>
+          <td class="mono small">{{ e.token }}</td>
+          <td class="small">{{ e.replacement }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="small mut">原值以密文密封（绑定规则版本+请求+token）；本页、数据库审计
+      与证据包导出均不含明文。</p>
+    {% else %}
+    <p class="small mut">该请求没有遮盖映射（未命中替换规则、被 deny 但未 redact 之外、
+      或为无隔离旧请求）。</p>
+    {% endif %}
+
+    {% if has_mask and entries %}
+    <h2>申请 / 使用短期还原凭据</h2>
+    {% if reviewers %}
+    <form method="post" action="/ui/requests/{{ req.request_id }}/mask/reveal-tokens">
+      <label>授权复核人</label>
+      <select name="reviewer">
+        {% for rv in reviewers %}<option value="{{ rv.reviewer }}">{{ rv.reviewer }}</option>{% endfor %}
+      </select>
+      <label>有效期（秒，60–3600）</label>
+      <input name="ttl_seconds" type="number" value="600" min="60" max="3600">
+      <div class="row" style="margin-top:8px"><button>签发一次性凭据</button></div>
+      <p class="small">凭据明文只在签发后<b>闪现一次</b>；请立即在下方使用，刷新页面即不可再看到。</p>
+    </form>
+    <form method="post" action="/ui/requests/{{ req.request_id }}/mask/reveal"
+          style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+      <label>复核人（须与凭据绑定身份一致）</label>
+      <select name="reviewer">
+        {% for rv in reviewers %}<option value="{{ rv.reviewer }}">{{ rv.reviewer }}</option>{% endfor %}
+      </select>
+      <label>一次性凭据</label>
+      <input name="token" placeholder="mrv_..." autocomplete="off" required>
+      <div class="row" style="margin-top:8px">
+        <button class="danger">消费凭据并还原原值（仅此一次）</button></div>
+      <p class="small warn">提交即消费：成功会在新页面展示原值一次；再提交同一凭据将被拒绝。</p>
+    </form>
+    {% else %}
+    <p class="small warn">该模板族还没有启用的授权复核人，请管理员先在隔离配置页添加。</p>
+    {% endif %}
+    {% endif %}
+  </div>
+</div>
+
+<div class="grid g2">
+  <div class="card">
+    <h2>还原凭据生命周期（不含明文）</h2>
+    <table>
+      <thead><tr><th>凭据</th><th>复核人</th><th>状态</th><th>过期</th><th>消费</th></tr></thead>
+      <tbody>
+      {% for t in tokens %}
+        <tr><td class="mono small">{{ t.token_id }}</td>
+          <td class="small">{{ t.reviewer }}</td>
+          <td>{% if t.status == 'consumed' %}<span class="badge b-superseded">consumed</span>
+            {% elif t.status == 'revoked' %}<span class="badge b-failed_eval">revoked</span>
+            {% else %}<span class="badge b-active">issued</span>{% endif %}</td>
+          <td class="small">{{ t.expires_at }}</td>
+          <td class="small">{% if t.consumed_at %}{{ t.consumed_at }} · {{ t.consumed_by }}
+            {% else %}—{% endif %}
+            {% if t.status == 'issued' %}
+            <form method="post"
+                  action="/ui/mask/reveal-tokens/{{ t.token_id }}/revoke"
+                  style="display:inline">
+              <input type="hidden" name="actor" value="admin">
+              <input type="hidden" name="back" value="/requests/{{ req.request_id }}/review">
+              <button class="ghost" type="submit">撤销</button>
+            </form>{% endif %}</td></tr>
+      {% endfor %}
+      {% if not tokens %}
+        <tr><td colspan="5" class="small mut">暂无凭据</td></tr>
+      {% endif %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>逐请求审计（隔离/凭据/还原，不含明文）</h2>
+    <table>
+      <tbody>
+      {% for a in audit_rows %}
+        <tr><td class="small mono">{{ a.created_at }}</td>
+          <td class="small"><b>{{ a.action }}</b></td>
+          <td class="small mut">{{ a.detail }}</td></tr>
+      {% endfor %}
+      {% if not audit_rows %}
+        <tr><td class="small mut">暂无审计记录</td></tr>
+      {% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>
